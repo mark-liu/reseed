@@ -1,0 +1,29 @@
+[package]
+name = "reseed"
+version = "0.1.0"
+edition = "2021"
+description = "Distill a Claude Code session: strip tool calls into an addressable archive, keep the narrative, reseed a fresh context window."
+license = "MIT"
+repository = "https://github.com/mark-liu/reseed"
+keywords = ["claude-code", "llm", "context", "agent", "transcript"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "reseed"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+sha2 = "0.10"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

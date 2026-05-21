@@ -1,0 +1,286 @@
+//! reseed — distill a Claude Code session into a slim, reloadable bundle.
+//!
+//! A long Claude Code session is dominated by tool input/output: in
+//! typical transcripts the `tool_use` + `tool_result` blocks are 60-65%
+//! of the bytes, while the actual user↔assistant narrative is ~12%.
+//! `reseed` strips the tool I/O into an addressable, defang-on-read
+//! archive, keeps the narrative with `[tool#NNN]` pointers, lists the
+//! files the session touched, and reports the token savings — so you can
+//! `/clear` and reseed a fresh context window without losing the thread.
+
+mod defang;
+mod distill;
+mod parse;
+mod tokens;
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Parser)]
+#[command(name = "reseed", version, about = "Distill a Claude Code session into a reloadable bundle")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Distill a session into a bundle (narrative + tool archive + savings).
+    Distill {
+        /// Session id (prefix ok) or a path to a transcript .jsonl.
+        session: String,
+        /// Output directory (default: ~/.claude/reseed/<session-id>).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Print one archived tool call, defanged by default.
+    Fetch {
+        /// Session id (prefix ok) or path to a bundle directory.
+        session: String,
+        /// Pointer number, e.g. 42 (matches [tool#042]).
+        n: usize,
+        /// Print raw, un-defanged bytes (re-injection risk — debug only).
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Distill, then launch a fresh `claude` seeded to read the narrative.
+    Launch {
+        /// Session id (prefix ok) or a path to a transcript .jsonl.
+        session: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+fn main() -> Result<()> {
+    match Cli::parse().command {
+        Command::Distill { session, out } => {
+            let bundle_dir = run_distill(&session, out)?;
+            println!("Bundle written to {}", bundle_dir.display());
+            println!(
+                "Reseed with:  claude  then  \"Read {}/narrative.md and continue\"",
+                bundle_dir.display()
+            );
+            Ok(())
+        }
+        Command::Fetch { session, n, raw } => run_fetch(&session, n, raw),
+        Command::Launch { session, out } => {
+            let bundle_dir = run_distill(&session, out)?;
+            launch_claude(&bundle_dir)
+        }
+    }
+}
+
+/// Distill a session and write the bundle. Returns the bundle directory.
+fn run_distill(session: &str, out: Option<PathBuf>) -> Result<PathBuf> {
+    let transcript = resolve_transcript(session)?;
+    let session_id = transcript
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session")
+        .to_string();
+
+    let file = fs::File::open(&transcript)
+        .with_context(|| format!("opening transcript {}", transcript.display()))?;
+    let items = parse::parse_reader(file)?;
+    if items.is_empty() {
+        bail!("no conversation content found in {}", transcript.display());
+    }
+
+    let bundle = distill::distill(&items, &session_id);
+    let dir = match out {
+        Some(d) => d,
+        None => default_bundle_dir(&session_id)?,
+    };
+    write_bundle(&dir, &bundle)?;
+
+    eprintln!(
+        "[reseed] {} tool calls archived · ~{} → ~{} tokens ({:.0}% saved)",
+        bundle.calls.len(),
+        bundle.full_tokens,
+        bundle.distilled_tokens,
+        savings_pct(bundle.full_tokens, bundle.distilled_tokens),
+    );
+    Ok(dir)
+}
+
+fn write_bundle(dir: &Path, bundle: &distill::Bundle) -> Result<()> {
+    let calls_dir = dir.join("calls");
+    fs::create_dir_all(&calls_dir)
+        .with_context(|| format!("creating bundle dir {}", dir.display()))?;
+
+    fs::write(dir.join("narrative.md"), &bundle.narrative)?;
+    fs::write(
+        dir.join("context-files.md"),
+        distill::render_context_files(&bundle.context_files),
+    )?;
+    fs::write(dir.join("index.json"), &bundle.index_json)?;
+    fs::write(dir.join("savings.md"), &bundle.savings_md)?;
+
+    for call in &bundle.calls {
+        let path = calls_dir.join(format!("{:03}.json", call.n));
+        let json = serde_json::to_string_pretty(call)?;
+        fs::write(path, json)?;
+    }
+    Ok(())
+}
+
+/// Read one archived call and print it. Defangs input + result unless
+/// `--raw`, mirroring the transcript-as-backdoor threat model.
+fn run_fetch(session: &str, n: usize, raw: bool) -> Result<()> {
+    let dir = resolve_bundle_dir(session)?;
+    let path = dir.join("calls").join(format!("{n:03}.json"));
+    let body = fs::read_to_string(&path)
+        .with_context(|| format!("reading {} — has this session been distilled?", path.display()))?;
+    let call: serde_json::Value = serde_json::from_str(&body)?;
+
+    let name = call.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
+    let input = call.get("input").map(|v| v.to_string()).unwrap_or_default();
+    let result = call
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let (input, result) = if raw {
+        eprintln!("[reseed] --raw: printing un-defanged bytes (re-injection risk)");
+        (input, result.to_string())
+    } else {
+        (defang::defang(&input), defang::defang(result))
+    };
+
+    println!("tool#{n:03} {name}");
+    println!("--- input ---\n{input}");
+    println!("--- result ---\n{result}");
+    Ok(())
+}
+
+/// Launch `claude` seeded with an instruction to read the bundle. Best
+/// effort: if `claude` is not on PATH we report the manual command.
+fn launch_claude(bundle_dir: &Path) -> Result<()> {
+    let seed = format!(
+        "Read {}/narrative.md and {}/context-files.md, then continue where we left off. \
+         Fetch archived tool calls with `reseed fetch <session> <N>` if you need detail.",
+        bundle_dir.display(),
+        bundle_dir.display()
+    );
+    eprintln!("[reseed] launching: claude \"<seed>\"");
+    let status = std::process::Command::new("claude").arg(&seed).status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => bail!("claude exited with status {s}"),
+        Err(_) => {
+            println!("`claude` not found on PATH. Start it manually and paste:\n\n{seed}");
+            Ok(())
+        }
+    }
+}
+
+fn savings_pct(full: usize, distilled: usize) -> f64 {
+    if full == 0 {
+        0.0
+    } else {
+        full.saturating_sub(distilled) as f64 / full as f64 * 100.0
+    }
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME not set")
+}
+
+fn default_bundle_dir(session_id: &str) -> Result<PathBuf> {
+    Ok(home_dir()?.join(".claude/reseed").join(session_id))
+}
+
+/// Resolve a session argument to a transcript file. Accepts a direct path
+/// to a `.jsonl`, or a session-id prefix searched under
+/// `~/.claude/projects/*/`.
+fn resolve_transcript(session: &str) -> Result<PathBuf> {
+    let direct = Path::new(session);
+    if direct.is_file() {
+        return Ok(direct.to_path_buf());
+    }
+    let projects = home_dir()?.join(".claude/projects");
+    let mut matches = Vec::new();
+    if let Ok(project_dirs) = fs::read_dir(&projects) {
+        for project in project_dirs.flatten() {
+            let Ok(entries) = fs::read_dir(project.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let is_jsonl = p.extension().is_some_and(|e| e == "jsonl");
+                let stem_matches = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|stem| stem.starts_with(session));
+                if is_jsonl && stem_matches {
+                    matches.push(p);
+                }
+            }
+        }
+    }
+    select_unique_session(matches, session, &projects)
+}
+
+/// Pick the transcript to distill from prefix matches. Files sharing the
+/// same stem are the *same* logical session living under more than one
+/// project dir (resumed from a different cwd, or a sync copy) — pick the
+/// most recently modified. Distinct stems are a genuinely ambiguous prefix.
+fn select_unique_session(
+    mut matches: Vec<PathBuf>,
+    session: &str,
+    projects: &Path,
+) -> Result<PathBuf> {
+    if matches.is_empty() {
+        bail!("no transcript found for '{session}' under {}", projects.display());
+    }
+    let stems: std::collections::HashSet<_> = matches
+        .iter()
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .collect();
+    if stems.len() > 1 {
+        bail!(
+            "'{session}' is ambiguous — {} distinct sessions match; pass a longer id or a full path",
+            stems.len()
+        );
+    }
+    // Same session in multiple project dirs: newest mtime wins.
+    matches.sort_by_key(|p| {
+        fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    Ok(matches.pop().expect("non-empty checked above"))
+}
+
+/// Resolve a session argument to a bundle directory (for `fetch`). Accepts
+/// a direct directory path or a session-id under `~/.claude/reseed/`.
+fn resolve_bundle_dir(session: &str) -> Result<PathBuf> {
+    let direct = Path::new(session);
+    if direct.is_dir() && direct.join("calls").is_dir() {
+        return Ok(direct.to_path_buf());
+    }
+    let reseed = home_dir()?.join(".claude/reseed");
+    let mut matches = Vec::new();
+    if let Ok(entries) = fs::read_dir(&reseed) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir()
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.starts_with(session))
+            {
+                matches.push(p);
+            }
+        }
+    }
+    match matches.len() {
+        0 => bail!("no distilled bundle for '{session}' under {}", reseed.display()),
+        1 => Ok(matches.remove(0)),
+        _ => bail!("'{session}' is ambiguous across {} bundles", matches.len()),
+    }
+}
