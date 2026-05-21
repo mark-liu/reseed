@@ -64,7 +64,7 @@ pub fn parse_reader<R: Read>(reader: R) -> Result<Vec<Item>> {
         let Some(message) = parsed.message else {
             continue;
         };
-        let role = message.role.unwrap_or_default();
+        let role = message.role.unwrap_or_else(|| "unknown".to_string());
         match message.content {
             Some(Value::String(text)) if !text.trim().is_empty() => {
                 items.push(Item::Text { role, text });

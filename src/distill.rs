@@ -10,7 +10,7 @@
 
 use crate::parse::{content_to_string, Item};
 use crate::tokens;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ const FILE_TOOLS: &[&str] = &["Read", "Edit", "Write", "MultiEdit", "NotebookEdi
 
 /// One archived tool call paired with its result. Serialized to
 /// `calls/NNN.json`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Call {
     pub n: usize,
     pub tool_use_id: String,
@@ -74,7 +74,9 @@ pub fn distill(items: &[Item], session: &str) -> Bundle {
 
     // Pass 2: walk in document order — number tool calls, build the
     // narrative with inline pointers, and pair each call with its result.
-    let mut narrative = String::new();
+    // Seed capacity from a rough narrative-fraction of total content to
+    // avoid repeated reallocation on long sessions.
+    let mut narrative = String::with_capacity(8 * 1024);
     writeln!(narrative, "# Reseed narrative — session {session}\n").ok();
     narrative.push_str(
         "> Distilled Claude Code session. Tool calls are elided as \
@@ -115,7 +117,9 @@ pub fn distill(items: &[Item], session: &str) -> Bundle {
                     }
                 }
 
-                let result = results.get(id).cloned().unwrap_or_default();
+                // Move the result out of the map — each id is consumed
+                // once, so removing frees the (potentially large) string.
+                let result = results.remove(id).unwrap_or_default();
                 let bytes = result.len();
                 let sha256 = sha256_prefix(&result);
                 calls.push(Call {

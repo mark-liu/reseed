@@ -32,11 +32,16 @@ fn word_re() -> &'static Regex {
 pub fn defang(s: &str) -> String {
     word_re()
         .replace_all(s, |caps: &regex::Captures| {
-            caps[0]
-                .chars()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(&SEP.to_string())
+            let word = &caps[0];
+            // Interleave SEP between chars without per-char String allocs.
+            let mut out = String::with_capacity(word.len() * 2);
+            for (i, c) in word.chars().enumerate() {
+                if i > 0 {
+                    out.push(SEP);
+                }
+                out.push(c);
+            }
+            out
         })
         .into_owned()
 }

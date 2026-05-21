@@ -134,23 +134,18 @@ fn run_fetch(session: &str, n: usize, raw: bool) -> Result<()> {
     let path = dir.join("calls").join(format!("{n:03}.json"));
     let body = fs::read_to_string(&path)
         .with_context(|| format!("reading {} — has this session been distilled?", path.display()))?;
-    let call: serde_json::Value = serde_json::from_str(&body)?;
+    let call: distill::Call = serde_json::from_str(&body)
+        .with_context(|| format!("parsing archived call {}", path.display()))?;
 
-    let name = call.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
-    let input = call.get("input").map(|v| v.to_string()).unwrap_or_default();
-    let result = call
-        .get("result")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-
+    let input = call.input.to_string();
     let (input, result) = if raw {
         eprintln!("[reseed] --raw: printing un-defanged bytes (re-injection risk)");
-        (input, result.to_string())
+        (input, call.result)
     } else {
-        (defang::defang(&input), defang::defang(result))
+        (defang::defang(&input), defang::defang(&call.result))
     };
 
-    println!("tool#{n:03} {name}");
+    println!("tool#{n:03} {}", call.tool_name);
     println!("--- input ---\n{input}");
     println!("--- result ---\n{result}");
     Ok(())
@@ -195,6 +190,16 @@ fn default_bundle_dir(session_id: &str) -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude/reseed").join(session_id))
 }
 
+/// List the immediate children of a directory as paths. Returns an empty
+/// vec on any IO error (missing dir, permission) — callers treat "no
+/// children" and "unreadable" the same: nothing matched.
+fn children(dir: &Path) -> Vec<PathBuf> {
+    match fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().map(|e| e.path()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Resolve a session argument to a transcript file. Accepts a direct path
 /// to a `.jsonl`, or a session-id prefix searched under
 /// `~/.claude/projects/*/`.
@@ -205,21 +210,15 @@ fn resolve_transcript(session: &str) -> Result<PathBuf> {
     }
     let projects = home_dir()?.join(".claude/projects");
     let mut matches = Vec::new();
-    if let Ok(project_dirs) = fs::read_dir(&projects) {
-        for project in project_dirs.flatten() {
-            let Ok(entries) = fs::read_dir(project.path()) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let p = entry.path();
-                let is_jsonl = p.extension().is_some_and(|e| e == "jsonl");
-                let stem_matches = p
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|stem| stem.starts_with(session));
-                if is_jsonl && stem_matches {
-                    matches.push(p);
-                }
+    for project in children(&projects) {
+        for p in children(&project) {
+            let is_jsonl = p.extension().is_some_and(|e| e == "jsonl");
+            let stem_matches = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem.starts_with(session));
+            if is_jsonl && stem_matches {
+                matches.push(p);
             }
         }
     }
@@ -266,16 +265,13 @@ fn resolve_bundle_dir(session: &str) -> Result<PathBuf> {
     }
     let reseed = home_dir()?.join(".claude/reseed");
     let mut matches = Vec::new();
-    if let Ok(entries) = fs::read_dir(&reseed) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir()
-                && p.file_name()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|name| name.starts_with(session))
-            {
-                matches.push(p);
-            }
+    for p in children(&reseed) {
+        let name_matches = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| name.starts_with(session));
+        if p.is_dir() && name_matches {
+            matches.push(p);
         }
     }
     match matches.len() {
