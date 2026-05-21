@@ -75,6 +75,11 @@ The narrative itself is kept raw: it is user/assistant text, the low-risk
 slice. The high-risk raw tool output lives only in the archive, behind the
 defanging fetch.
 
+Defang is defense-in-depth, not a hard boundary: it reliably defeats
+literal and regex pattern matching, but a capable model may still read
+`i·g·n·o·r·e` as `ignore`, and short or non-ASCII tokens pass through. Treat
+it as one layer, not a guarantee.
+
 ## Token estimate
 
 `reseed` uses a `chars / 4` heuristic — no API key, no network. Absolute

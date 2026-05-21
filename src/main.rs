@@ -108,6 +108,12 @@ fn run_distill(session: &str, out: Option<PathBuf>) -> Result<PathBuf> {
 
 fn write_bundle(dir: &Path, bundle: &distill::Bundle) -> Result<()> {
     let calls_dir = dir.join("calls");
+    // Clear a prior calls/ so re-distilling a shrunk transcript can't leave
+    // stale, higher-numbered call files behind that no pointer references.
+    if calls_dir.exists() {
+        fs::remove_dir_all(&calls_dir)
+            .with_context(|| format!("clearing stale {}", calls_dir.display()))?;
+    }
     fs::create_dir_all(&calls_dir)
         .with_context(|| format!("creating bundle dir {}", dir.display()))?;
 
