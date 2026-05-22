@@ -1,6 +1,6 @@
 [package]
 name = "reseed"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Distill a Claude Code session: strip tool calls into an addressable archive, keep the narrative, reseed a fresh context window."
 license = "MIT"
