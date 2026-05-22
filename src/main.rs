@@ -19,7 +19,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "reseed", version, about = "Distill a Claude Code session into a reloadable bundle")]
+#[command(
+    name = "reseed",
+    version,
+    about = "Distill a Claude Code session into a reloadable bundle"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -97,11 +101,12 @@ fn run_distill(session: &str, out: Option<PathBuf>) -> Result<PathBuf> {
     write_bundle(&dir, &bundle)?;
 
     eprintln!(
-        "[reseed] {} tool calls archived · ~{} → ~{} tokens ({:.0}% saved)",
+        "[reseed] {} tool calls archived · ~{} → ~{} tokens ({:.0}% saved) · ~{} tokens of harness boilerplate dropped from narrative",
         bundle.calls.len(),
         bundle.full_tokens,
         bundle.distilled_tokens,
         savings_pct(bundle.full_tokens, bundle.distilled_tokens),
+        bundle.harness_stripped_tokens,
     );
     Ok(dir)
 }
@@ -138,8 +143,12 @@ fn write_bundle(dir: &Path, bundle: &distill::Bundle) -> Result<()> {
 fn run_fetch(session: &str, n: usize, raw: bool) -> Result<()> {
     let dir = resolve_bundle_dir(session)?;
     let path = dir.join("calls").join(format!("{n:03}.json"));
-    let body = fs::read_to_string(&path)
-        .with_context(|| format!("reading {} — has this session been distilled?", path.display()))?;
+    let body = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "reading {} — has this session been distilled?",
+            path.display()
+        )
+    })?;
     let call: distill::Call = serde_json::from_str(&body)
         .with_context(|| format!("parsing archived call {}", path.display()))?;
 
@@ -241,7 +250,10 @@ fn select_unique_session(
     projects: &Path,
 ) -> Result<PathBuf> {
     if matches.is_empty() {
-        bail!("no transcript found for '{session}' under {}", projects.display());
+        bail!(
+            "no transcript found for '{session}' under {}",
+            projects.display()
+        );
     }
     let stems: std::collections::HashSet<_> = matches
         .iter()
@@ -281,7 +293,10 @@ fn resolve_bundle_dir(session: &str) -> Result<PathBuf> {
         }
     }
     match matches.len() {
-        0 => bail!("no distilled bundle for '{session}' under {}", reseed.display()),
+        0 => bail!(
+            "no distilled bundle for '{session}' under {}",
+            reseed.display()
+        ),
         1 => Ok(matches.remove(0)),
         _ => bail!("'{session}' is ambiguous across {} bundles", matches.len()),
     }
