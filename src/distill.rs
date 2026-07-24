@@ -277,7 +277,11 @@ pub fn render_context_files(files: &[String]) -> String {
     let mut s = String::from(
         "# Files this session touched\n\n\
          Derived from Read / Edit / Write / NotebookEdit tool calls in the \
-         transcript.\nPreload or re-open these as needed.\n\n",
+         transcript.\nPreload or re-open these as needed.\n\n\
+         Paths are HISTORICAL: recorded at the moment of each tool call. A file \
+         moved or renamed later in the session is listed at its old path too, so \
+         two entries may share a basename. Confirm a path exists before passing it \
+         to a command; when a basename repeats, the later entry is the current one.\n\n",
     );
     if files.is_empty() {
         s.push_str("_(none)_\n");
