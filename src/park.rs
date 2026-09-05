@@ -8,6 +8,8 @@ use std::sync::OnceLock;
 
 const MAX_LINES: usize = 8;
 const CUT: usize = 3000;
+/// Floor for a shortened line: enough to carry its date and subject phrase.
+const MIN_CUT: usize = 240;
 const MIN_HITS: usize = 4;
 const DF_MAX: f64 = 0.20;
 const DF_MIN_LINES: usize = 20;
@@ -266,14 +268,64 @@ fn tail<T>(mut v: Vec<T>, n: usize) -> Vec<T> {
 
 /// Render matches as `<lineno>: <line cut to CUT chars>`, one per line.
 pub fn render(matches: &[(usize, String)]) -> String {
+    render_cut(matches, CUT)
+}
+
+fn render_cut(matches: &[(usize, String)], cut: usize) -> String {
     matches
         .iter()
         .map(|(n, line)| {
-            let cut: String = line.chars().take(CUT).collect();
-            format!("{n}: {cut}")
+            let text: String = line.chars().take(cut).collect();
+            format!("{n}: {text}")
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A park block rendered to fit a byte budget.
+pub struct Fitted {
+    pub text: String,
+    /// Ledger line numbers left out of the block entirely.
+    pub dropped: Vec<usize>,
+    /// Surviving lines were cut shorter than the normal width.
+    pub shortened: bool,
+}
+
+/// Render within a byte budget. Shortens every line before dropping any: a
+/// short line is still checkable against the subject, a missing one is not.
+/// Returns the full-width render untouched whenever it already fits.
+pub fn render_within(matches: &[(usize, String)], budget: usize) -> Fitted {
+    let full = render(matches);
+    if full.len() <= budget {
+        return Fitted {
+            text: full,
+            dropped: Vec::new(),
+            shortened: false,
+        };
+    }
+    for cut in [2000, 1200, 800, 500, 360, MIN_CUT] {
+        let shorter = render_cut(matches, cut);
+        if shorter.len() <= budget {
+            return Fitted {
+                text: shorter,
+                dropped: Vec::new(),
+                shortened: true,
+            };
+        }
+    }
+    let mut kept = matches.to_vec();
+    let mut dropped = Vec::new();
+    while kept.len() > 1 && render_cut(&kept, MIN_CUT).len() > budget {
+        if let Some((n, _)) = kept.pop() {
+            dropped.push(n);
+        }
+    }
+    dropped.reverse();
+    Fitted {
+        text: render_cut(&kept, MIN_CUT),
+        dropped,
+        shortened: true,
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +440,56 @@ mod tests {
         assert_eq!(out.len(), MAX_LINES);
         assert!(out.last().unwrap().starts_with("12: "));
         assert!(out[0].len() <= CUT + 5);
+    }
+
+    /// Eight full-width candidates are about 24 KB, three times the reload's
+    /// inline limit, so `render_within` is what keeps a bundle deliverable.
+    fn fat_matches() -> Vec<(usize, String)> {
+        let ledger: Vec<String> = (1..=12)
+            .map(|i| format!("{i} | weekly-review-20260904 {}", "x".repeat(4000)))
+            .collect();
+        matches(NARRATIVE, &ledger)
+    }
+
+    #[test]
+    fn render_within_leaves_a_fitting_block_alone() {
+        let m = fat_matches();
+        let fitted = render_within(&m, 60_000);
+        assert_eq!(fitted.text, render(&m));
+        assert!(!fitted.shortened);
+        assert!(fitted.dropped.is_empty());
+    }
+
+    #[test]
+    fn render_within_shortens_before_dropping() {
+        let m = fat_matches();
+        let fitted = render_within(&m, 5_600);
+        assert!(fitted.text.len() <= 5_600);
+        assert!(fitted.shortened);
+        assert!(fitted.dropped.is_empty());
+        assert_eq!(fitted.text.lines().count(), m.len());
+        for (n, _) in &m {
+            assert!(fitted.text.contains(&format!("{n}: ")));
+        }
+    }
+
+    #[test]
+    fn render_within_drops_only_once_shortening_is_not_enough() {
+        let m = fat_matches();
+        let fitted = render_within(&m, 900);
+        assert!(fitted.text.len() <= 900);
+        assert!(!fitted.dropped.is_empty());
+        assert_eq!(fitted.text.lines().count() + fitted.dropped.len(), m.len());
+        for n in &fitted.dropped {
+            assert!(!fitted.text.contains(&format!("{n}: ")));
+        }
+    }
+
+    #[test]
+    fn render_within_keeps_one_line_even_under_an_impossible_budget() {
+        let m = fat_matches();
+        let fitted = render_within(&m, 1);
+        assert_eq!(fitted.text.lines().count(), 1);
+        assert_eq!(fitted.dropped.len(), m.len() - 1);
     }
 }
