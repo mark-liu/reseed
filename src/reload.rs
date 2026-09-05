@@ -2,7 +2,7 @@
 //! reload text on stdout. Ported from `reseed-clear-hook.sh` and the tier
 //! semantics in `reseed-clear-hook.md`. Fails open: never exits non-zero.
 
-use crate::{emit, park, paths, sentinel, spawn};
+use crate::{emit, msg, park, paths, sentinel, spawn};
 use anyhow::Result;
 use regex::Regex;
 use serde::Deserialize;
@@ -18,6 +18,31 @@ const MAX_GEN_HOPS: u32 = 15;
 /// 9,831 B delivered and 11,276 B persisted (2,081 records, no sample between).
 /// A persisted reload reaches the model as a path, so 8 KB keeps real margin.
 pub const STDOUT_CAP: usize = 8 * 1024;
+
+/// Fallbacks for the operator-facing texts. A site overrides any of these by
+/// name under `$RESEED_MESSAGES`, so its own doctrine never compiles into
+/// this crate. See `msg`.
+const PROVENANCE_DEFAULT: &str = "PROVENANCE (checked mechanically): this bundle is generation \
+     {gen} of a reseed chain - its own first user turn was `/clear` + \"go\", so its subject was \
+     INHERITED down the chain, not chosen for this thread. It is a CANDIDATE, not a brief. Local \
+     work (reading, analysis, drafting to ~/scratch/) proceeds; name the inherited subject back \
+     to {op} in one line and get a yes BEFORE any outward-facing write (Notion/Slack/GitLab/\
+     GitHub create-or-post) - a resumed authorisation is not a live authorisation.";
+
+const PARK_HEAD_DEFAULT: &str = "Park-ledger CANDIDATE lines, keyword-matched at /clear against \
+     this bundle's narrative (the ledger file stays closed - grep it directly only for a resource \
+     you are about to re-derive, never tail/sed/cat it). Verify EACH against the subject you read \
+     in narrative.md: a non-matching line is ANOTHER THREAD'S WORK and its resume: pointer is an \
+     address, not an assignment:";
+
+const STALE_HEAD_DEFAULT: &str = "A session reload was armed {age}m ago for the session you just \
+     cleared, and re-distilled just now.";
+
+const STALE_RESUME_DEFAULT: &str = "If the first message resumes that work, or is just \"go\" / \
+     \"continue\" / \"carry on\", do this: {reload}";
+
+const STALE_UNRELATED_DEFAULT: &str = "If it clearly opens an UNRELATED task, do NOT read the \
+     bundle: answer what was asked and note the reload path above in one line.";
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Payload {
@@ -329,16 +354,9 @@ fn prov_banner(reload: &str) -> (u32, Option<String>) {
     if gen == 0 {
         return (0, None);
     }
-    let text = format!(
-        "PROVENANCE (checked mechanically): this bundle is generation {gen} of a reseed chain - \
-         its own first user turn was `/clear` + \"go\", so its subject was INHERITED down the \
-         chain, not chosen for this thread. It is a CANDIDATE, not a brief. Local work (reading, \
-         analysis, drafting to ~/scratch/) proceeds; name the inherited subject back to {op} in \
-         one line and get a yes BEFORE any outward-facing write (Notion/Slack/GitLab/GitHub \
-         create-or-post) - a resumed authorisation is not a live authorisation.\n\n",
-        op = operator(),
-    );
-    (gen, Some(text))
+    let template = msg::text("provenance", PROVENANCE_DEFAULT);
+    let text = msg::fill(&template, &[("gen", &gen.to_string()), ("op", &operator())]);
+    (gen, Some(format!("{text}\n\n")))
 }
 
 fn log_row(env: &Env, log_path: &Path, tier: &str, arm_path: Option<&Path>, gen: &str) {
@@ -364,11 +382,7 @@ fn park_block(reload: &str, budget: usize) -> Option<String> {
     let narrative = std::fs::read_to_string(bundle.join("narrative.md")).ok()?;
     let lines: Vec<String> = ledger_text.lines().map(String::from).collect();
     let matches = park::matches(&narrative, &lines);
-    let head = "\nPark-ledger CANDIDATE lines, keyword-matched at /clear against this bundle's \
-         narrative (the ledger file stays closed - grep it directly only for a resource you are \
-         about to re-derive, never tail/sed/cat it). Verify EACH against the subject you read in \
-         narrative.md: a non-matching line is ANOTHER THREAD'S WORK and its resume: pointer is an \
-         address, not an assignment:\n";
+    let head = format!("\n{}\n", msg::text("park-head", PARK_HEAD_DEFAULT));
     let fitted = park::render_within(
         &matches,
         budget.saturating_sub(head.len() + ELISION_RESERVE),
@@ -557,19 +571,14 @@ fn deliver_stale(env: &Env, log_path: &Path, tier: &str, a: &sentinel::Arm) -> R
         .unwrap_or(0);
     let key = key_of(a);
     spawn::rearm(&key);
-    fixed.push_str(&format!(
-        "A session reload was armed {age_mins}m ago for the session you just cleared, and \
-         re-distilled just now.\n"
-    ));
-    fixed.push_str(&format!(
-        "If the first message resumes that work, or is just \"go\" / \"continue\" / \"carry on\", \
-         do this: {}\n",
-        a.reload
-    ));
-    fixed.push_str(
-        "If it clearly opens an UNRELATED task, do NOT read the bundle: answer what was asked \
-         and note the reload path above in one line.\n",
-    );
+    let head = msg::text("stale-head", STALE_HEAD_DEFAULT);
+    fixed.push_str(&msg::fill(&head, &[("age", &age_mins.to_string())]));
+    fixed.push('\n');
+    let resume = msg::text("stale-resume", STALE_RESUME_DEFAULT);
+    fixed.push_str(&msg::fill(&resume, &[("reload", &a.reload)]));
+    fixed.push('\n');
+    fixed.push_str(&msg::text("stale-unrelated", STALE_UNRELATED_DEFAULT));
+    fixed.push('\n');
     print!("{}", emit_capped(fixed, &a.reload, &key, env));
     log_row(env, log_path, tier, Some(&a.path), &gen.to_string());
     sentinel::remove(a);

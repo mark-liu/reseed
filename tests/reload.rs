@@ -99,7 +99,16 @@ fn backdate(path: &Path, secs: u64) {
 }
 
 fn run_reload(home: &Path, ledger: &Path) -> String {
-    let mut child = bin()
+    run_reload_with(home, ledger, None)
+}
+
+fn run_reload_with(home: &Path, ledger: &Path, messages: Option<&Path>) -> String {
+    let mut cmd = bin();
+    match messages {
+        Some(d) => cmd.env("RESEED_MESSAGES", d),
+        None => cmd.env_remove("RESEED_MESSAGES"),
+    };
+    let mut child = cmd
         .arg("reload")
         .env("HOME", home)
         .env("RESEED_PARK_LEDGER", ledger)
@@ -195,6 +204,30 @@ fn a_stale_emission_fits_the_cap_behind_its_wrapper() {
     );
     assert!(out.contains("was armed"), "stale wrapper missing");
     assert!(out.contains("UNRELATED task"), "opt-out missing");
+}
+
+/// Deviation 5: the doctrine texts are data, so this public crate carries
+/// only a neutral fallback and the site's own wording lives outside it.
+#[test]
+fn a_message_override_replaces_the_compiled_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let bundle = plant_bundle(home);
+    plant_sentinel(home, &reload_text(&bundle));
+    let messages = home.join("messages");
+    fs::create_dir_all(&messages).unwrap();
+    fs::write(
+        messages.join("provenance.txt"),
+        "SITE BANNER for {op}, generation {gen}.\n",
+    )
+    .unwrap();
+    let out = run_reload_with(home, &short_ledger(home), Some(&messages));
+
+    assert!(out.contains("SITE BANNER for Mark, generation 1."));
+    assert!(
+        !out.contains("PROVENANCE (checked mechanically)"),
+        "the override must replace the default, not sit beside it"
+    );
 }
 
 #[test]
