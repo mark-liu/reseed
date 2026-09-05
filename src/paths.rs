@@ -39,6 +39,11 @@ pub fn tasks() -> Result<PathBuf> {
     Ok(home()?.join(".claude/tasks"))
 }
 
+/// Session registry dir: one `<pid>.json` per live session, `sessionId` inside.
+pub fn sessions_dir() -> Result<PathBuf> {
+    Ok(home()?.join(".claude/sessions"))
+}
+
 pub fn emit_log() -> Result<PathBuf> {
     Ok(reseed_dir()?.join("emit.log"))
 }

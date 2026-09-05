@@ -21,6 +21,7 @@ mod hooks;
 mod park;
 mod parse;
 mod paths;
+mod reload;
 mod sentinel;
 mod spawn;
 mod tokens;
@@ -86,6 +87,9 @@ enum Command {
         #[arg(long)]
         pid: Option<u32>,
     },
+    /// SessionStart(clear) hook: emit an armed reload, if any. Reads the
+    /// SessionStart payload from stdin when stdin is not a terminal.
+    Reload,
     /// Run one of the reset-workflow hooks, reading its event payload on stdin.
     Hook {
         #[command(subcommand)]
@@ -149,6 +153,7 @@ fn main() -> Result<()> {
             std::process::exit(code);
         }
         Command::ParkMatch { bundle_dir, ledger } => run_park_match(&bundle_dir, ledger),
+        Command::Reload => reload::run(reload::read_payload()),
     }
 }
 
