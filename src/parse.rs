@@ -30,10 +30,7 @@ struct Message {
 #[derive(Debug, Clone)]
 pub enum Item {
     /// A user or assistant text block.
-    Text {
-        role: String,
-        text: String,
-    },
+    Text { role: String, text: String },
     /// An assistant tool invocation.
     ToolUse {
         id: String,
@@ -42,10 +39,7 @@ pub enum Item {
         timestamp: Option<String>,
     },
     /// A tool result, keyed back to its `ToolUse` by `tool_use_id`.
-    ToolResult {
-        tool_use_id: String,
-        content: Value,
-    },
+    ToolResult { tool_use_id: String, content: Value },
 }
 
 /// Parse a reader of JSONL into an ordered item stream. Malformed lines are
@@ -170,9 +164,13 @@ mod tests {
         let items = parse_reader(jsonl.as_bytes()).unwrap();
         // user text, assistant text, tool_use, tool_result — thinking + snapshot dropped.
         assert_eq!(items.len(), 4);
-        assert!(matches!(&items[0], Item::Text { role, text } if role == "user" && text == "hello world"));
+        assert!(
+            matches!(&items[0], Item::Text { role, text } if role == "user" && text == "hello world")
+        );
         assert!(matches!(&items[1], Item::Text { role, .. } if role == "assistant"));
-        assert!(matches!(&items[2], Item::ToolUse { id, name, .. } if id == "t1" && name == "Read"));
+        assert!(
+            matches!(&items[2], Item::ToolUse { id, name, .. } if id == "t1" && name == "Read")
+        );
         assert!(matches!(&items[3], Item::ToolResult { tool_use_id, .. } if tool_use_id == "t1"));
     }
 
