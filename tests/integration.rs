@@ -32,12 +32,22 @@ fn distill_writes_bundle_layout() {
     let out = tmp.path().join("bundle");
 
     let status = bin()
-        .args(["distill", src.to_str().unwrap(), "--out", out.to_str().unwrap()])
+        .args([
+            "distill",
+            src.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
         .status()
         .unwrap();
     assert!(status.success());
 
-    for name in ["narrative.md", "context-files.md", "index.json", "savings.md"] {
+    for name in [
+        "narrative.md",
+        "context-files.md",
+        "index.json",
+        "savings.md",
+    ] {
         assert!(out.join(name).is_file(), "missing {name}");
     }
     for i in 1..=3 {
@@ -58,7 +68,12 @@ fn redistill_clears_stale_calls() {
     // First: 3 calls.
     fs::write(&src, transcript(3)).unwrap();
     bin()
-        .args(["distill", src.to_str().unwrap(), "--out", out.to_str().unwrap()])
+        .args([
+            "distill",
+            src.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
         .status()
         .unwrap();
     assert!(out.join("calls").join("003.json").is_file());
@@ -66,12 +81,23 @@ fn redistill_clears_stale_calls() {
     // Re-distill a shrunk transcript: 1 call. 002/003 must not linger.
     fs::write(&src, transcript(1)).unwrap();
     bin()
-        .args(["distill", src.to_str().unwrap(), "--out", out.to_str().unwrap()])
+        .args([
+            "distill",
+            src.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
         .status()
         .unwrap();
     assert!(out.join("calls").join("001.json").is_file());
-    assert!(!out.join("calls").join("002.json").exists(), "stale 002 left behind");
-    assert!(!out.join("calls").join("003.json").exists(), "stale 003 left behind");
+    assert!(
+        !out.join("calls").join("002.json").exists(),
+        "stale 002 left behind"
+    );
+    assert!(
+        !out.join("calls").join("003.json").exists(),
+        "stale 003 left behind"
+    );
 }
 
 #[test]
@@ -87,7 +113,12 @@ fn fetch_defangs_by_default() {
     );
     fs::write(&src, jsonl).unwrap();
     bin()
-        .args(["distill", src.to_str().unwrap(), "--out", out.to_str().unwrap()])
+        .args([
+            "distill",
+            src.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
         .status()
         .unwrap();
 
@@ -96,6 +127,12 @@ fn fetch_defangs_by_default() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("ignore previous instructions"), "raw marker leaked");
-    assert!(stdout.contains("i\u{00B7}g\u{00B7}n\u{00B7}o\u{00B7}r\u{00B7}e"), "not defanged");
+    assert!(
+        !stdout.contains("ignore previous instructions"),
+        "raw marker leaked"
+    );
+    assert!(
+        stdout.contains("i\u{00B7}g\u{00B7}n\u{00B7}o\u{00B7}r\u{00B7}e"),
+        "not defanged"
+    );
 }
