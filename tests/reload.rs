@@ -256,3 +256,126 @@ fn an_oversize_reload_text_degrades_to_the_bundle_path() {
         "the oversize text must not be inlined"
     );
 }
+
+const OLD_SID: &str = "99887766-5555-4444-3333-222211110000";
+const JOB: &str = "b8816add";
+
+/// A generation-0 bundle: its first user turn is a real prompt, so no
+/// provenance banner is prepended and `fixed` is the reload text alone.
+fn plant_owned_bundle(home: &Path, sid: &str) -> PathBuf {
+    let dir = home.join(".claude/reseed").join(sid);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("narrative.md"),
+        format!("# Reseed narrative\n\n**user:**\n\napply the {SLUG} harness cards\n"),
+    )
+    .unwrap();
+    fs::write(dir.join("context-files.md"), "_(none)_\n").unwrap();
+    dir
+}
+
+/// A reload text of exactly `len` bytes naming `bundle`, ending in a marker
+/// no other section carries. ASCII throughout, so byte length is char length.
+fn reload_text_sized(bundle: &Path, len: usize) -> String {
+    const TAIL: &str = " END-OF-RELOAD-TEXT\n";
+    let mut s = format!(
+        "Read {}/narrative.md in full and continue.",
+        bundle.display()
+    );
+    assert!(s.len() + TAIL.len() <= len, "bundle path alone exceeds len");
+    while s.len() + TAIL.len() < len {
+        s.push_str(" Local work proceeds; get a yes before any outward-facing write.");
+    }
+    s.truncate(len - TAIL.len());
+    s.push_str(TAIL);
+    assert_eq!(s.len(), len);
+    s
+}
+
+/// A sentinel keyed on `OLD_SID` with a `.job` sidecar, the tier-2 route: the
+/// carry-over only runs when the armed key differs from the new session id.
+fn plant_job_sentinel(home: &Path, reload: &str) -> PathBuf {
+    let pending = home.join(".claude/reseed/pending");
+    fs::create_dir_all(&pending).unwrap();
+    let path = pending.join(OLD_SID);
+    fs::write(&path, reload).unwrap();
+    fs::write(pending.join(format!("{OLD_SID}.job")), JOB).unwrap();
+    path
+}
+
+fn plant_tasks(home: &Path, key: &str, n: usize) {
+    let dir = home.join(".claude/tasks").join(key);
+    fs::create_dir_all(&dir).unwrap();
+    for i in 1..=n {
+        fs::write(
+            dir.join(format!("{i}.json")),
+            format!(r#"{{"id":"{i}","subject":"card {i}","status":"pending"}}"#),
+        )
+        .unwrap();
+    }
+}
+
+fn run_reload_in_job(home: &Path, ledger: &Path) -> String {
+    let mut child = bin()
+        .arg("reload")
+        .env("HOME", home)
+        .env("RESEED_PARK_LEDGER", ledger)
+        .env("RESEED_OPERATOR", "Mark")
+        .env("CLAUDE_JOB_DIR", home.join("jobs").join(JOB))
+        .env_remove("RESEED_MESSAGES")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("PWD")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = format!(r#"{{"session_id":"{SID}","cwd":"{}"}}"#, home.display());
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "reload must always exit 0");
+    String::from_utf8(out.stdout).expect("stdout is valid UTF-8")
+}
+
+/// Sizes the reload text so the fixed section clears the cap by less than the
+/// carry-over note needs. Appending the note unguarded is what overflowed.
+fn boundary_emission(home: &Path) -> String {
+    let bundle = plant_owned_bundle(home, OLD_SID);
+    plant_job_sentinel(home, &reload_text_sized(&bundle, CAP - 40));
+    plant_tasks(home, OLD_SID, 8);
+    run_reload_in_job(home, &short_ledger(home))
+}
+
+#[test]
+fn a_task_carry_over_cannot_push_the_emission_over_the_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = boundary_emission(tmp.path());
+
+    assert!(
+        out.len() <= CAP,
+        "emission was {} bytes, over the {CAP} byte cap",
+        out.len()
+    );
+    assert!(out.contains("Task list carried over"), "carry-over missing");
+}
+
+#[test]
+fn a_reload_that_fits_alone_stays_inline_when_the_carry_over_does_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = boundary_emission(tmp.path());
+
+    assert!(
+        out.contains("END-OF-RELOAD-TEXT"),
+        "the reload text was dropped for a bundle pointer to make room for a \
+         150-byte advisory note; the note is what gives way, not the brief"
+    );
+    assert!(
+        !out.contains("past the"),
+        "degraded to the oversize pointer while the reload text still fit"
+    );
+}
