@@ -64,11 +64,8 @@ mod tests {
         assert_eq!(out, "gen 3 for Mark, {mystery}");
     }
 
-    /// `RESEED_MESSAGES` is process-global, so these tests must not overlap.
     fn temp_env(dir: &std::path::Path, f: impl FnOnce()) {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _held = crate::testlock::env_lock();
         std::env::set_var("RESEED_MESSAGES", dir);
         f();
         std::env::remove_var("RESEED_MESSAGES");

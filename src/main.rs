@@ -25,6 +25,8 @@ mod paths;
 mod reload;
 mod sentinel;
 mod spawn;
+#[cfg(test)]
+mod testlock;
 mod tokens;
 mod usage;
 mod watch;
