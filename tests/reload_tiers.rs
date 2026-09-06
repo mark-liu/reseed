@@ -430,3 +430,54 @@ fn no_match_says_none_and_absent_ledger_is_silent() {
     );
     assert!(!out.contains("Park-ledger CANDIDATE lines") && out.contains("narrative.md"));
 }
+
+// --- armed-at clock ------------------------------------------------------------
+
+fn run_tz(home: &Path, tz: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_reseed"))
+        .arg("reload")
+        .env("HOME", home)
+        .env("PWD", "/work")
+        .env("TZ", tz)
+        .env("RESEED_OPERATOR", "Mark")
+        .env_remove("RESEED_MESSAGES")
+        .env_remove("RESEED_PARK_LEDGER")
+        .env_remove("CLAUDE_JOB_DIR")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(br#"{"session_id": "new-id", "cwd": "/work"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The hour from the first `armed HH:MM:SS` in a candidates report.
+fn armed_hour(out: &str) -> u32 {
+    // ", armed " and not "armed ": the preamble says "are armed for N sessions".
+    let at = out.find(", armed ").expect("no armed-at in the report");
+    out[at + 8..at + 10].parse().expect("armed-at is not HH")
+}
+
+/// The operator reads this clock against their own wall clock to tell two
+/// candidate arms apart, so it follows TZ as the shell's `stat -f %Sm` did.
+#[test]
+fn ambiguous_candidates_report_armed_at_in_local_time() {
+    let h = home();
+    arm(h.path(), "a", "/work", false, None);
+    arm(h.path(), "b", "/work", false, None);
+    let utc = run_tz(h.path(), "UTC");
+    let plus10 = run_tz(h.path(), "Etc/GMT-10"); // POSIX sign inversion: UTC+10
+    assert_eq!(
+        (armed_hour(&utc) + 10) % 24,
+        armed_hour(&plus10),
+        "clock ignored TZ\nutc:\n{utc}\nplus10:\n{plus10}"
+    );
+}
