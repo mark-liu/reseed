@@ -433,16 +433,11 @@ fn classify(projects_dir: &Path, sid8: &str) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::tempdir;
 
-    /// `HOME` is process-global (mirrors `msg::tests::temp_env`): serialise
-    /// every test that points it at a fixture dir.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-
     fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
-        let _held = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _held = crate::testlock::env_lock();
         std::env::set_var("HOME", home);
         let out = f();
         std::env::remove_var("HOME");

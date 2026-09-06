@@ -71,9 +71,11 @@ pub fn window_for_model(model: Option<&str>) -> u64 {
     }
 }
 
-/// The three absolute nudge lines for this window, low to high.
-pub fn tier_lines(window: u64) -> [u64; 3] {
-    let line = reset_line() as f64;
+/// The three absolute nudge lines for this window, low to high. Pure: the
+/// environment is read by the caller, so the arithmetic stays testable in
+/// parallel with the tests that override `STATUSLINE_RESET_LINE`.
+pub fn tier_lines_from(reset: u64, window: u64) -> [u64; 3] {
+    let line = reset as f64;
     let mut out = [0u64; 3];
     for i in 0..3 {
         let capped = (line * TIER_MULTS[i]).min(TIER_WINDOW_CAPS[i] * window as f64);
@@ -82,9 +84,19 @@ pub fn tier_lines(window: u64) -> [u64; 3] {
     out
 }
 
+/// `tier_lines_from` against the configured reset line.
+pub fn tier_lines(window: u64) -> [u64; 3] {
+    tier_lines_from(reset_line(), window)
+}
+
 /// Where the early band starts: `EARLY_FRACTION` of the tier-1 line.
+pub fn early_line_from(reset: u64, window: u64) -> u64 {
+    (tier_lines_from(reset, window)[0] as f64 * EARLY_FRACTION) as u64
+}
+
+/// `early_line_from` against the configured reset line.
 pub fn early_line(window: u64) -> u64 {
-    (tier_lines(window)[0] as f64 * EARLY_FRACTION) as u64
+    early_line_from(reset_line(), window)
 }
 
 /// Count of lines `ctx` is at or past, 0..3. `None` ctx is tier 0, never
@@ -223,19 +235,19 @@ mod tests {
 
     #[test]
     fn tier_lines_default_300k_window_1m() {
-        let lines = tier_lines(1_000_000);
+        let lines = tier_lines_from(DEFAULT_RESET_LINE, 1_000_000);
         assert_eq!(lines, [300_000, 375_000, 425_100]);
     }
 
     #[test]
     fn tier_lines_capped_by_small_window() {
-        let lines = tier_lines(200_000);
+        let lines = tier_lines_from(DEFAULT_RESET_LINE, 200_000);
         assert_eq!(lines, [150_000, 175_000, 190_000]);
     }
 
     #[test]
     fn early_line_is_80pct_of_tier1() {
-        assert_eq!(early_line(1_000_000), 240_000);
+        assert_eq!(early_line_from(DEFAULT_RESET_LINE, 1_000_000), 240_000);
     }
 
     #[test]
@@ -291,6 +303,7 @@ mod tests {
 
     #[test]
     fn reset_line_override_via_env() {
+        let _held = crate::testlock::env_lock();
         std::env::set_var("STATUSLINE_RESET_LINE", "30000");
         assert_eq!(reset_line(), 30_000);
         std::env::remove_var("STATUSLINE_RESET_LINE");
@@ -298,6 +311,7 @@ mod tests {
 
     #[test]
     fn reset_line_ignores_non_positive_override() {
+        let _held = crate::testlock::env_lock();
         std::env::set_var("STATUSLINE_RESET_LINE", "-5");
         assert_eq!(reset_line(), DEFAULT_RESET_LINE);
         std::env::remove_var("STATUSLINE_RESET_LINE");
