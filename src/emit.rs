@@ -120,7 +120,52 @@ fn parse_row(line: &str) -> Option<Tier> {
     })
 }
 
-fn parse_ts_secs(ts: &str) -> Option<u64> {
+/// One parsed `emit.log` row, `ts` kept alongside the `Tier` fields so a
+/// caller (the `watch` audit) can window or order by time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogRow {
+    pub ts: String,
+    pub tier: String,
+    pub sid: String,
+    pub job: String,
+    pub cwd: String,
+    pub arm: String,
+    pub gen: String,
+}
+
+/// Every row in `emit.log`, oldest first. A missing file is an empty vec,
+/// not an error: an unseeded host has simply never emitted.
+pub fn read_rows(log_path: &Path) -> Result<Vec<LogRow>> {
+    let f = match std::fs::File::open(log_path) {
+        Ok(f) => f,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for line in BufReader::new(f).lines().map_while(std::result::Result::ok) {
+        if let Some(row) = parse_full_row(&line) {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_full_row(line: &str) -> Option<LogRow> {
+    let ts = line.split('\t').next()?.to_string();
+    let t = parse_row(line)?;
+    Some(LogRow {
+        ts,
+        tier: t.tier,
+        sid: t.sid,
+        job: t.job,
+        cwd: t.cwd,
+        arm: t.arm,
+        gen: t.gen,
+    })
+}
+
+/// Seconds since the Unix epoch for a `%FT%TZ` timestamp. Public so callers
+/// windowing `emit.log` (the `watch` audit's `--since`) share this parser.
+pub fn parse_ts_secs(ts: &str) -> Option<u64> {
     // %FT%TZ, e.g. 2026-09-05T13:05:00Z. Parsed by hand to avoid a chrono dep.
     let ts = ts.strip_suffix('Z')?;
     let (date, time) = ts.split_once('T')?;

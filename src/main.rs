@@ -27,6 +27,7 @@ mod sentinel;
 mod spawn;
 mod tokens;
 mod usage;
+mod watch;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -103,6 +104,23 @@ enum Command {
         /// Ledger path (default: RESEED_PARK_LEDGER or ~/scratch/parked/<Host>.md).
         ledger: Option<PathBuf>,
     },
+    /// Report-only reload detector: live sessions past the context line,
+    /// and an audit of whether recent reload emissions were delivered.
+    /// Never types into a session (spec 11c: detector half only).
+    Watch {
+        /// The only supported mode for now; accepted, always a single pass.
+        #[arg(long)]
+        once: bool,
+        /// Window the emit.log audit to the last N days.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Override the watch.log path (default: ~/.claude/reseed/watch.log).
+        #[arg(long)]
+        log: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -155,6 +173,17 @@ fn main() -> Result<()> {
         }
         Command::ParkMatch { bundle_dir, ledger } => run_park_match(&bundle_dir, ledger),
         Command::Reload => reload::run(reload::read_payload()),
+        Command::Watch {
+            once,
+            since,
+            json,
+            log,
+        } => watch::run(watch::WatchOpts {
+            once,
+            since_days: since,
+            json,
+            log_path: log,
+        }),
     }
 }
 
