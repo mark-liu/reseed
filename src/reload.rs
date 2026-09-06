@@ -486,20 +486,25 @@ fn key_of(a: &sentinel::Arm) -> String {
 /// after reserving the task carry-over. Emitting once, rather than a print
 /// per section, is what makes the cap assertable.
 fn emit_capped(fixed: String, reload_text: &str, key: &str, env: &Env) -> String {
-    let mut out = if fixed.len() <= STDOUT_CAP {
+    let tasks = carry_tasks(key, env);
+    let reserve = tasks.as_deref().map_or(0, str::len);
+    // Both mandatory sections are sized BEFORE the representation is chosen:
+    // sizing `fixed` alone let `fixed + tasks` clear the cap and still overflow.
+    let mut out = if fixed.len() + reserve <= STDOUT_CAP {
         fixed
     } else {
         oversize_pointer(reload_text, fixed.len())
     };
-    let tasks = carry_tasks(key, env);
-    let reserve = tasks.as_deref().map_or(0, str::len);
     let budget = STDOUT_CAP.saturating_sub(out.len() + reserve);
     if let Some(block) = park_block(reload_text, budget) {
         out.push_str(&truncate_bytes(&block, budget));
     }
     if let Some(t) = tasks {
-        out.push_str(&t);
+        // A truncated carry-over beats an over-cap emission: past the limit the
+        // harness hands the model a file pointer and every section is lost.
+        out.push_str(&truncate_bytes(&t, STDOUT_CAP.saturating_sub(out.len())));
     }
+    debug_assert!(out.len() <= STDOUT_CAP, "emission over cap: {}", out.len());
     out
 }
 
