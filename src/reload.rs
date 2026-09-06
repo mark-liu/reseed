@@ -671,15 +671,21 @@ fn report_ambiguous(env: &Env, log_path: &Path, cands: &[sentinel::Arm]) {
     println!("If it opens an UNRELATED task, ignore them and answer what was asked.");
 }
 
-/// HH:MM:SS the arm was written. UTC, not local time (the shell used local
-/// `stat -f %Sm`): no test asserts on the value, and a local-time rollover
-/// would need a tz table this crate does not otherwise carry.
+/// HH:MM:SS the arm was written, in the operator's own timezone as the shell's
+/// `stat -f %Sm` printed it. The value is read to tell two candidate arms
+/// apart, so a UTC clock beside a local wall clock is a wrong answer.
 fn armed_at(a: &sentinel::Arm) -> String {
     let secs = a
         .mtime
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let rem = secs % 86_400;
-    format!("{:02}:{:02}:{:02}", rem / 3600, (rem % 3600) / 60, rem % 60)
+        .unwrap_or(0) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: the reentrant form writes only into `tm` and reads only `secs`,
+    // both owned here, so no static buffer is shared with another thread.
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        let rem = (secs as u64) % 86_400;
+        return format!("{:02}:{:02}:{:02}", rem / 3600, (rem % 3600) / 60, rem % 60);
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
