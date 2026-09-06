@@ -488,9 +488,7 @@ fn key_of(a: &sentinel::Arm) -> String {
 fn emit_capped(fixed: String, reload_text: &str, key: &str, env: &Env) -> String {
     let tasks = carry_tasks(key, env);
     let reserve = tasks.as_deref().map_or(0, str::len);
-    // Both mandatory sections are sized BEFORE the representation is chosen:
-    // sizing `fixed` alone let `fixed + tasks` clear the cap and still overflow.
-    let mut out = if fixed.len() + reserve <= STDOUT_CAP {
+    let mut out = if fixed.len() <= STDOUT_CAP {
         fixed
     } else {
         oversize_pointer(reload_text, fixed.len())
@@ -500,8 +498,8 @@ fn emit_capped(fixed: String, reload_text: &str, key: &str, env: &Env) -> String
         out.push_str(&truncate_bytes(&block, budget));
     }
     if let Some(t) = tasks {
-        // A truncated carry-over beats an over-cap emission: past the limit the
-        // harness hands the model a file pointer and every section is lost.
+        // The note gives way, not the brief: it is advisory, the files were
+        // already copied, and a pointer would cost every section instead.
         out.push_str(&truncate_bytes(&t, STDOUT_CAP.saturating_sub(out.len())));
     }
     debug_assert!(out.len() <= STDOUT_CAP, "emission over cap: {}", out.len());
