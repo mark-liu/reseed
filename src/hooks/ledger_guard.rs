@@ -98,44 +98,13 @@ reflex:
 
     tail -8 ~/scratch/parked/<Host>.md | cut -c1-400  # ledger-survey";
 
-/// Mask heredoc bodies as prose: `<<WORD` up to the matching terminator
-/// line, hand-scanned (P4) since the Python pattern needs a backreference.
-fn mask_heredocs(command: &str) -> String {
-    let lines: Vec<&str> = command.split('\n').collect();
-    // No backreference (P4): the closing quote is not re-checked against the
-    // opening one, a heuristic mismatch cost worth avoiding the `regex` gap.
-    let start_re = Regex::new(r#"<<-?\s*['"]?(\w+)"#).unwrap();
-    let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    let mut i = 0;
-    while i < lines.len() {
-        if let Some(cap) = start_re.captures(lines[i]) {
-            let word = cap.get(1).unwrap().as_str().to_string();
-            out.push(" ".repeat(lines[i].len()));
-            i += 1;
-            while i < lines.len() {
-                let terminator = lines[i].trim();
-                out.push(" ".repeat(lines[i].len()));
-                let matched = terminator == word;
-                i += 1;
-                if matched {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(lines[i].to_string());
-        i += 1;
-    }
-    out.join("\n")
-}
-
 /// True when the command reads the park ledger by position, not by content.
 pub fn is_positional_ledger_read(command: &str) -> bool {
     if survey_marker().is_match(command) {
         return false;
     }
     let stripped = quoted_span()
-        .replace_all(&mask_heredocs(command), " ")
+        .replace_all(&super::mask_heredocs(command), " ")
         .into_owned();
     if content_select().is_match(&stripped) {
         return false;
