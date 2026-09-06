@@ -86,8 +86,13 @@ That rebuilds the full bundle from scratch, so never narrate lost context or
 ask the operator what they were doing until that step has been tried.";
 
 /// True when the command lists the reseed parent rather than descending into it.
+///
+/// Heredoc bodies are masked first (spec 3.4, deviation from the Python): the
+/// segment split treats every body line as its own command, so writing a file
+/// that quotes the blocked listing was blocked as if it were the listing.
 pub fn is_parent_probe(command: &str) -> bool {
-    let command = quoted_span().replace_all(command, " ");
+    let masked = super::mask_heredocs(command);
+    let command = quoted_span().replace_all(&masked, " ");
     for segment in segment_split().split(&command) {
         if text_authoring().is_match(segment) {
             continue;
@@ -175,6 +180,27 @@ mod tests {
         for (cmd, expect_block) in cases() {
             assert_eq!(is_parent_probe(cmd), expect_block, "case: {cmd}");
         }
+    }
+
+    /// Spec 3.4, the one deliberate deviation from the Python: a heredoc BODY
+    /// that quotes the listing is prose being written to a file, the same
+    /// listing outside a heredoc is still the listing.
+    #[test]
+    fn heredoc_body_passes_but_the_bare_listing_still_blocks() {
+        let authoring = "cat > guard-notes.md <<'EOF'\nls -la ~/.claude/reseed\nEOF";
+        assert!(!is_parent_probe(authoring), "heredoc body must pass");
+
+        let unquoted_word = "cat > guard-notes.md <<EOF\nls -la ~/.claude/reseed\nEOF";
+        assert!(!is_parent_probe(unquoted_word), "unquoted <<WORD must pass");
+
+        assert!(
+            is_parent_probe("ls -la ~/.claude/reseed"),
+            "the bare listing must still block"
+        );
+        assert!(
+            is_parent_probe("cat > notes.md <<'EOF'\nprose\nEOF\nls -la ~/.claude/reseed"),
+            "a listing AFTER a closed heredoc must still block"
+        );
     }
 
     #[test]
