@@ -1,0 +1,726 @@
+//! `reseed watch`: the reload DETECTOR, report only. Lists live sessions
+//! past the context line and audits whether recent reload emissions
+//! actually reached a context. Types nothing into any session (spec 11c);
+//! the keystroke path stays unbuilt.
+
+use crate::{emit, paths, sentinel, usage};
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+pub struct WatchOpts {
+    /// Accepted for the future polling mode; this phase always runs once.
+    pub once: bool,
+    pub since_days: Option<u64>,
+    pub json: bool,
+    pub log_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionReport {
+    pub sid8: String,
+    pub kind: String,
+    pub ctx_k: Option<u64>,
+    pub tier: u8,
+    pub armed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Delivered,
+    Cancelled,
+    Persisted,
+    Missing,
+    /// The receiving session's transcript is gone, so delivery is unknowable.
+    /// Kept apart from `Missing`: counting it as a failure would inflate the
+    /// loss rate this detector exists to measure.
+    Unknown,
+}
+
+impl Verdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Delivered => "delivered",
+            Verdict::Cancelled => "cancelled",
+            Verdict::Persisted => "persisted",
+            Verdict::Missing => "missing",
+            Verdict::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditRow {
+    pub ts: String,
+    pub tier: String,
+    pub sid8: String,
+    pub verdict: Verdict,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct AuditCounts {
+    pub delivered: usize,
+    pub cancelled: usize,
+    pub persisted: usize,
+    pub missing: usize,
+    pub unknown: usize,
+}
+
+impl AuditCounts {
+    fn add(&mut self, v: Verdict) {
+        match v {
+            Verdict::Delivered => self.delivered += 1,
+            Verdict::Cancelled => self.cancelled += 1,
+            Verdict::Persisted => self.persisted += 1,
+            Verdict::Missing => self.missing += 1,
+            Verdict::Unknown => self.unknown += 1,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.delivered + self.cancelled + self.persisted + self.missing + self.unknown
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub sessions: Vec<SessionReport>,
+    pub audit: Vec<AuditRow>,
+    pub counts: AuditCounts,
+}
+
+pub fn run(opts: WatchOpts) -> Result<()> {
+    let report = build_report(opts.since_days)?;
+    let log_path = match opts.log_path {
+        Some(p) => p,
+        None => paths::watch_log()?,
+    };
+    append_log(&log_path, &report)?;
+
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_text(&report);
+    }
+    if !opts.once {
+        eprintln!("watch: no polling loop in this build, ran a single pass anyway");
+    }
+    Ok(())
+}
+
+fn print_text(report: &Report) {
+    println!("Live sessions past the context line:");
+    if report.sessions.is_empty() {
+        println!("  (none)");
+    }
+    for s in &report.sessions {
+        println!(
+            "  {} {:<8} ctx={:>4}k tier={} armed={}",
+            s.sid8,
+            s.kind,
+            s.ctx_k.map(|k| k.to_string()).unwrap_or_else(|| "?".into()),
+            s.tier,
+            s.armed,
+        );
+    }
+    println!();
+    println!("Reload delivery audit:");
+    for a in &report.audit {
+        println!(
+            "  {} sid={} tier={} -> {}",
+            a.ts,
+            a.sid8,
+            a.tier,
+            a.verdict.as_str()
+        );
+    }
+    println!(
+        "counts: delivered={} cancelled={} persisted={} missing={} unknown={} total={}",
+        report.counts.delivered,
+        report.counts.cancelled,
+        report.counts.persisted,
+        report.counts.missing,
+        report.counts.unknown,
+        report.counts.total(),
+    );
+}
+
+fn append_log(log_path: &Path, report: &Report) -> Result<()> {
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    let ts = now_ts();
+    for s in &report.sessions {
+        let ctx_k = s.ctx_k.map(|k| k.to_string()).unwrap_or_default();
+        writeln!(
+            f,
+            "{ts}\t{}\t{ctx_k}\t{}\tnone\treport\ttier{}\t{}",
+            s.sid8,
+            s.kind,
+            s.tier,
+            if s.armed { "armed" } else { "unarmed" },
+        )?;
+    }
+    for a in &report.audit {
+        writeln!(
+            f,
+            "{ts}\t{}\t\taudit\tnone\treport\t{}\ttier={}",
+            a.sid8,
+            a.verdict.as_str(),
+            a.tier,
+        )?;
+    }
+    Ok(())
+}
+
+/// `%FT%TZ` now, matching `emit.log`'s own timestamp shape.
+fn now_ts() -> String {
+    // Reuses emit's row writer purely for its timestamp: log a throwaway
+    // row to a scratch buffer is overkill, so format directly instead.
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    emit_ts_from_secs(secs)
+}
+
+fn emit_ts_from_secs(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Howard Hinnant's `civil_from_days`, duplicated from `emit` (private
+/// there): days since epoch to (year, month, day).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn build_report(since_days: Option<u64>) -> Result<Report> {
+    let sessions = live_sessions_past_line()?;
+    let audit = audit_emit_log(since_days)?;
+    let mut counts = AuditCounts::default();
+    for a in &audit {
+        counts.add(a.verdict);
+    }
+    Ok(Report {
+        sessions,
+        audit,
+        counts,
+    })
+}
+
+/// Registry fields this phase reads: enough to name a session and tell
+/// bg from terminal. Parsed loosely; a malformed `<pid>.json` is skipped.
+#[derive(serde::Deserialize)]
+struct RegistryEntry {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(rename = "jobId")]
+    job_id: Option<String>,
+}
+
+fn live_sessions_past_line() -> Result<Vec<SessionReport>> {
+    let sessions_dir = paths::sessions_dir()?;
+    let projects_dir = paths::projects()?;
+    let pending = paths::pending()?;
+    let mut out = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return Ok(out);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(reg) = serde_json::from_str::<RegistryEntry>(&body) else {
+            continue;
+        };
+        let Some(sid) = reg.session_id.filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let kind = if reg.job_id.filter(|j| !j.is_empty()).is_some() {
+            "bg"
+        } else {
+            "terminal"
+        };
+        let transcript = find_transcript(&projects_dir, &sid);
+        let (tier, ctx, _line, _early) = match &transcript {
+            Some(p) => usage::context_state(p),
+            None => (0, None, 0, 0),
+        };
+        if tier == 0 {
+            continue; // not past the line: out of scope for this report
+        }
+        let armed = sentinel::read(&pending, &sentinel::key(&sid)).is_some();
+        out.push(SessionReport {
+            sid8: sid.chars().take(8).collect(),
+            kind: kind.to_string(),
+            ctx_k: ctx.map(|c| c / 1000),
+            tier,
+            armed,
+        });
+    }
+    out.sort_by(|a, b| a.sid8.cmp(&b.sid8));
+    Ok(out)
+}
+
+/// A transcript whose filename stem is exactly `sid` (session ids are full
+/// UUIDs; the registry always knows the whole id, never a prefix).
+fn find_transcript(projects_dir: &Path, sid: &str) -> Option<PathBuf> {
+    for project in read_dir_paths(projects_dir) {
+        for p in read_dir_paths(&project) {
+            if p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && p.file_stem().and_then(|s| s.to_str()) == Some(sid)
+            {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// A transcript matched by an 8-char `sid8` prefix, as `emit.log` truncates
+/// it. Ambiguous prefixes are vanishingly unlikely at 8 hex chars; the
+/// first match is used, same tradeoff `main.rs` makes for `fetch`.
+fn find_transcript_by_prefix(projects_dir: &Path, sid8: &str) -> Option<PathBuf> {
+    for project in read_dir_paths(projects_dir) {
+        for p in read_dir_paths(&project) {
+            let is_jsonl = p.extension().and_then(|e| e.to_str()) == Some("jsonl");
+            let matches = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem.starts_with(sid8));
+            if is_jsonl && matches {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn read_dir_paths(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
+fn audit_emit_log(since_days: Option<u64>) -> Result<Vec<AuditRow>> {
+    let log_path = paths::emit_log()?;
+    let projects_dir = paths::projects()?;
+    let rows = emit::read_rows(&log_path)?;
+    let cutoff = since_days.map(|d| {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(d * 86_400)
+    });
+
+    let mut out = Vec::new();
+    for row in rows {
+        if !is_delivery_attempt(&row.tier) {
+            continue;
+        }
+        if let Some(cutoff) = cutoff {
+            if emit::parse_ts_secs(&row.ts).unwrap_or(0) < cutoff {
+                continue;
+            }
+        }
+        let verdict = classify(&projects_dir, &row.sid);
+        out.push(AuditRow {
+            ts: row.ts,
+            tier: row.tier,
+            sid8: row.sid,
+            verdict,
+        });
+    }
+    Ok(out)
+}
+
+/// A `SessionStart` hook attachment, as it appears in a transcript line.
+#[derive(serde::Deserialize)]
+struct AttachmentLine {
+    attachment: Option<Attachment>,
+}
+
+#[derive(serde::Deserialize)]
+struct Attachment {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(rename = "hookName")]
+    hook_name: Option<String>,
+    content: Option<String>,
+    stdout: Option<String>,
+}
+
+/// Rows that are not a delivery attempt, and would skew the audit:
+/// a `3-declined-*` row records the hook naming a candidate and refusing to
+/// load it, and a `<tier>-done` row is the second row of one emission, not a
+/// second emission.
+fn is_delivery_attempt(tier: &str) -> bool {
+    !tier.contains("declined") && !tier.ends_with("-done")
+}
+
+/// The matcher that emits a reload. A transcript usually also carries a
+/// `SessionStart:startup` attachment (538 of them against 209 clear ones in
+/// a 400-file sample), so matching the event alone reads the wrong hook.
+const RELOAD_HOOK: &str = "SessionStart:clear";
+
+/// Verdict order (spec 11c, phase C brief section 2): cancelled, then
+/// persisted, then missing (transcript found, no clear attachment in it),
+/// else delivered. No transcript at all is `Unknown`, never a failure.
+fn classify(projects_dir: &Path, sid8: &str) -> Verdict {
+    let Some(path) = find_transcript_by_prefix(projects_dir, sid8) else {
+        return Verdict::Unknown;
+    };
+    let Ok(f) = std::fs::File::open(&path) else {
+        return Verdict::Unknown;
+    };
+    for line in BufReader::new(f).lines().map_while(std::result::Result::ok) {
+        if !line.contains("\"attachment\"") || !line.contains(RELOAD_HOOK) {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<AttachmentLine>(&line) else {
+            continue;
+        };
+        let Some(att) = entry.attachment else {
+            continue;
+        };
+        if att.hook_name.as_deref() != Some(RELOAD_HOOK) {
+            continue;
+        }
+        if att.kind.as_deref() == Some("hook_cancelled") {
+            return Verdict::Cancelled;
+        }
+        let body = format!(
+            "{}{}",
+            att.content.as_deref().unwrap_or(""),
+            att.stdout.as_deref().unwrap_or(""),
+        );
+        if body.contains("<persisted-output>") {
+            return Verdict::Persisted;
+        }
+        return Verdict::Delivered;
+    }
+    Verdict::Missing
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    /// `HOME` is process-global (mirrors `msg::tests::temp_env`): serialise
+    /// every test that points it at a fixture dir.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        let _held = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("HOME", home);
+        let out = f();
+        std::env::remove_var("HOME");
+        out
+    }
+
+    fn transcript_line(sid: &str, attachment_json: &str) -> String {
+        format!(
+            r#"{{"parentUuid":null,"isSidechain":false,"attachment":{attachment_json},"type":"attachment","uuid":"u1","timestamp":"2026-09-05T00:00:00.000Z","sessionKind":"bg","sessionId":"{sid}"}}"#
+        )
+    }
+
+    fn plant_transcript(projects: &Path, project: &str, sid: &str, attachment_json: &str) {
+        let dir = projects.join(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = transcript_line(sid, attachment_json);
+        std::fs::write(dir.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
+    }
+
+    fn plant_emit_row(home: &Path, tier: &str, sid8: &str, ts_offset_days: i64) {
+        let log = home.join(".claude/reseed/emit.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - ts_offset_days * 86_400;
+        let ts = emit_ts_from_secs(secs.max(0) as u64);
+        let row =
+            format!("{ts}\ttier={tier}\tsid={sid8}\tjob=none\tcwd=/x\tarm=full-{sid8}\tgen=0\n");
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .unwrap();
+        f.write_all(row.as_bytes()).unwrap();
+    }
+
+    fn projects_dir(home: &Path) -> PathBuf {
+        home.join(".claude/projects")
+    }
+
+    #[test]
+    fn delivered_emission_classifies_as_delivered() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"Read the bundle"}"#,
+        );
+        plant_emit_row(home, "2", "aaaaaaaa", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Delivered);
+    }
+
+    #[test]
+    fn cancelled_hook_classifies_as_cancelled() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            "bbbbbbbb-0000-0000-0000-000000000000",
+            r#"{"type":"hook_cancelled","hookName":"SessionStart:clear"}"#,
+        );
+        plant_emit_row(home, "2", "bbbbbbbb", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Cancelled);
+    }
+
+    #[test]
+    fn persisted_pointer_classifies_as_persisted() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let content = r#"<persisted-output>\nOutput too large (12.0KB). Full output saved to: /x/tool-results/y.txt\n"#;
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            "cccccccc-0000-0000-0000-000000000000",
+            &format!(
+                r#"{{"type":"hook_success","hookName":"SessionStart:clear","content":"{content}"}}"#
+            ),
+        );
+        plant_emit_row(home, "2", "cccccccc", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Persisted);
+    }
+
+    #[test]
+    fn no_matching_attachment_classifies_as_missing() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            "dddddddd-0000-0000-0000-000000000000",
+            r#"{"type":"hook_success","hookName":"PostToolUse:Bash","content":"unrelated"}"#,
+        );
+        plant_emit_row(home, "2", "dddddddd", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Missing);
+    }
+
+    /// A deleted transcript is unknowable, not a failed delivery: folding it
+    /// into `Missing` would inflate the loss rate the detector reports.
+    #[test]
+    fn absent_transcript_classifies_as_unknown() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_emit_row(home, "2", "eeeeeeee", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Unknown);
+    }
+
+    /// The regression that motivated `RELOAD_HOOK`: a startup attachment
+    /// sits ahead of the clear one in the same transcript, and matching the
+    /// event rather than the matcher reports the wrong hook's outcome.
+    #[test]
+    fn a_startup_attachment_does_not_stand_in_for_the_clear_one() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let dir = projects_dir(home).join("-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "ffffffff-0000-0000-0000-000000000000";
+        let startup = r#"{"type":"hook_success","hookName":"SessionStart:startup","content":"memory audit ok"}"#;
+        let clear = r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"<persisted-output>Output too large (14.9KB)."}"#;
+        let body = format!(
+            "{}\n{}\n",
+            transcript_line(sid, startup),
+            transcript_line(sid, clear)
+        );
+        std::fs::write(dir.join(format!("{sid}.jsonl")), body).unwrap();
+        plant_emit_row(home, "2", "ffffffff", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Persisted);
+    }
+
+    #[test]
+    fn declined_and_done_rows_are_not_delivery_attempts() {
+        assert!(is_delivery_attempt("2"));
+        assert!(is_delivery_attempt("2-stale"));
+        assert!(!is_delivery_attempt("3-declined-cwdonly-fresh"));
+        assert!(!is_delivery_attempt("3-declined-cwdonly-stale"));
+        assert!(!is_delivery_attempt("2-done"));
+        assert!(!is_delivery_attempt("1b-stale-done"));
+    }
+
+    /// A `-done` row would otherwise double-count its own emission once the
+    /// Rust `reload` starts writing one.
+    #[test]
+    fn a_done_row_does_not_add_a_second_audit_entry() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            "77777777-0000-0000-0000-000000000000",
+            r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"ok"}"#,
+        );
+        plant_emit_row(home, "2", "77777777", 0);
+        plant_emit_row(home, "2-done", "77777777", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].verdict, Verdict::Delivered);
+    }
+
+    /// A transcript carrying only a startup hook has no reload evidence.
+    #[test]
+    fn a_startup_only_transcript_classifies_as_missing() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            "99999999-0000-0000-0000-000000000000",
+            r#"{"type":"hook_success","hookName":"SessionStart:startup","content":"ok"}"#,
+        );
+        plant_emit_row(home, "2", "99999999", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Missing);
+    }
+
+    #[test]
+    fn counts_sum_to_row_total() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"ok"}"#,
+        );
+        plant_emit_row(home, "2", "aaaaaaaa", 0);
+        plant_emit_row(home, "2", "eeeeeeee", 0);
+        let audit = with_home(home, || audit_emit_log(None).unwrap());
+        let mut counts = AuditCounts::default();
+        for a in &audit {
+            counts.add(a.verdict);
+        }
+        assert_eq!(counts.total(), 2);
+    }
+
+    #[test]
+    fn since_window_excludes_older_rows() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_emit_row(home, "2", "ffffffff", 20);
+        plant_emit_row(home, "2", "aaaaaaaa", 0);
+        let audit = with_home(home, || audit_emit_log(Some(14)).unwrap());
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].sid8, "aaaaaaaa");
+    }
+
+    fn audit_over(home: &Path) -> Vec<AuditRow> {
+        with_home(home, || audit_emit_log(None).unwrap())
+    }
+
+    /// The subcommand may only ever create or append `watch.log`.
+    #[test]
+    fn run_writes_nothing_outside_watch_log() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".claude/sessions")).unwrap();
+        std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        std::fs::create_dir_all(home.join(".claude/reseed/pending")).unwrap();
+        plant_emit_row(home, "2", "aaaaaaaa", 0);
+
+        let before = snapshot(home);
+        with_home(home, || {
+            run(WatchOpts {
+                once: true,
+                since_days: None,
+                json: true,
+                log_path: None,
+            })
+            .unwrap()
+        });
+        let watch_log = home.join(".claude/reseed/watch.log");
+
+        let after = snapshot(home);
+        for (path, mtime) in &before {
+            if *path == watch_log {
+                continue;
+            }
+            assert_eq!(
+                after.get(path),
+                Some(mtime),
+                "{} was modified by watch",
+                path.display()
+            );
+        }
+        assert!(watch_log.exists());
+    }
+
+    fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Duration> {
+        let mut out = std::collections::BTreeMap::new();
+        walk(dir, &mut out);
+        out
+    }
+
+    fn walk(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Duration>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if let Ok(meta) = std::fs::metadata(&path) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .unwrap_or_default();
+                out.insert(path, mtime);
+            }
+        }
+    }
+}
