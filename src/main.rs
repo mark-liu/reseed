@@ -14,11 +14,13 @@
 
 mod arm;
 mod atomic;
+mod control;
 mod defang;
 mod distill;
 mod emit;
 mod hooks;
 mod identity;
+mod inject;
 mod msg;
 mod park;
 mod parse;
@@ -123,6 +125,13 @@ enum Command {
         /// Override the watch.log path (default: ~/.claude/reseed/watch.log).
         #[arg(long)]
         log: Option<PathBuf>,
+        /// Type `/clear` then `go` into background sessions that are past
+        /// the line with a bundle armed. Off unless asked for.
+        #[arg(long)]
+        inject: bool,
+        /// With --inject: report what it would type, type nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -186,11 +195,14 @@ fn main() -> Result<()> {
             since,
             json,
             log,
+            inject,
+            dry_run,
         } => watch::run(watch::WatchOpts {
             once,
             since_days: since,
             json,
             log_path: log,
+            inject: inject.then_some(inject::InjectOpts { dry_run }),
         }),
     }
 }
