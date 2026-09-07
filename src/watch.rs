@@ -346,12 +346,13 @@ fn audit_emit_log(since_days: Option<u64>) -> Result<Vec<AuditRow>> {
         if !is_delivery_attempt(&row.tier) {
             continue;
         }
+        let row_secs = emit::parse_ts_secs(&row.ts).unwrap_or(0);
         if let Some(cutoff) = cutoff {
-            if emit::parse_ts_secs(&row.ts).unwrap_or(0) < cutoff {
+            if row_secs < cutoff {
                 continue;
             }
         }
-        let verdict = classify(&projects_dir, &row.sid);
+        let verdict = classify(&projects_dir, &row.sid, row_secs);
         out.push(AuditRow {
             ts: row.ts,
             tier: row.tier,
@@ -366,6 +367,7 @@ fn audit_emit_log(since_days: Option<u64>) -> Result<Vec<AuditRow>> {
 #[derive(serde::Deserialize)]
 struct AttachmentLine {
     attachment: Option<Attachment>,
+    timestamp: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -394,7 +396,12 @@ const RELOAD_HOOK: &str = "SessionStart:clear";
 /// Verdict order (spec 11c, phase C brief section 2): cancelled, then
 /// persisted, then missing (transcript found, no clear attachment in it),
 /// else delivered. No transcript at all is `Unknown`, never a failure.
-fn classify(projects_dir: &Path, sid8: &str) -> Verdict {
+///
+/// Correlated on time, not on `sid8` alone: one session can carry several
+/// clear attachments, and only one at or after `row_secs` can be the outcome
+/// of this emission. An attachment the transcript failed to stamp is kept,
+/// since dropping it would report a delivery as `Missing`.
+fn classify(projects_dir: &Path, sid8: &str, row_secs: u64) -> Verdict {
     let Some(path) = find_transcript_by_prefix(projects_dir, sid8) else {
         return Verdict::Unknown;
     };
@@ -412,6 +419,10 @@ fn classify(projects_dir: &Path, sid8: &str) -> Verdict {
             continue;
         };
         if att.hook_name.as_deref() != Some(RELOAD_HOOK) {
+            continue;
+        }
+        let att_secs = entry.timestamp.as_deref().and_then(emit::parse_ts_secs);
+        if att_secs.is_some_and(|secs| secs < row_secs) {
             continue;
         }
         if att.kind.as_deref() == Some("hook_cancelled") {
@@ -444,10 +455,38 @@ mod tests {
         out
     }
 
+    /// Attachments are stamped ahead of the emit rows the helpers plant, the
+    /// only order the harness can produce: the hook logs, then its output is
+    /// attached. The margin keeps a slow fixture from inverting it.
     fn transcript_line(sid: &str, attachment_json: &str) -> String {
+        transcript_line_at(sid, 5, 0, attachment_json)
+    }
+
+    fn transcript_line_at(
+        sid: &str,
+        secs_from_now: i64,
+        millis: u32,
+        attachment_json: &str,
+    ) -> String {
+        let ts = attachment_ts(secs_from_now, millis);
         format!(
-            r#"{{"parentUuid":null,"isSidechain":false,"attachment":{attachment_json},"type":"attachment","uuid":"u1","timestamp":"2026-09-05T00:00:00.000Z","sessionKind":"bg","sessionId":"{sid}"}}"#
+            r#"{{"parentUuid":null,"isSidechain":false,"attachment":{attachment_json},"type":"attachment","uuid":"u1","timestamp":"{ts}","sessionKind":"bg","sessionId":"{sid}"}}"#
         )
+    }
+
+    /// A transcript timestamp: `emit.log`'s shape plus the milliseconds the
+    /// harness writes, so the fixture exercises the fractional-second path.
+    fn attachment_ts(secs_from_now: i64, millis: u32) -> String {
+        let secs = now_secs() + secs_from_now;
+        let base = emit_ts_from_secs(secs.max(0) as u64);
+        format!("{}.{millis:03}Z", base.trim_end_matches('Z'))
+    }
+
+    fn now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
     }
 
     fn plant_transcript(projects: &Path, project: &str, sid: &str, attachment_json: &str) {
@@ -460,11 +499,7 @@ mod tests {
     fn plant_emit_row(home: &Path, tier: &str, sid8: &str, ts_offset_days: i64) {
         let log = home.join(".claude/reseed/emit.log");
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-        let secs = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            - ts_offset_days * 86_400;
+        let secs = now_secs() - ts_offset_days * 86_400;
         let ts = emit_ts_from_secs(secs.max(0) as u64);
         let row =
             format!("{ts}\ttier={tier}\tsid={sid8}\tjob=none\tcwd=/x\tarm=full-{sid8}\tgen=0\n");
@@ -575,6 +610,51 @@ mod tests {
         plant_emit_row(home, "2", "ffffffff", 0);
         let audit = audit_over(home);
         assert_eq!(audit[0].verdict, Verdict::Persisted);
+    }
+
+    /// One session can carry several clear attachments (transcript
+    /// `e9b4ad27` carries two, 0.9s apart). Matching on `sid8` alone returns
+    /// the first one in the file, so an outcome that predates the emission
+    /// is reported as its own.
+    #[test]
+    fn an_earlier_attachment_is_not_this_emissions_outcome() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let dir = projects_dir(home).join("-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "12121212-0000-0000-0000-000000000000";
+        let earlier = r#"{"type":"hook_cancelled","hookName":"SessionStart:clear"}"#;
+        let mine = r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"Read the bundle"}"#;
+        let body = format!(
+            "{}\n{}\n",
+            transcript_line_at(sid, -30, 0, earlier),
+            transcript_line_at(sid, 5, 651, mine)
+        );
+        std::fs::write(dir.join(format!("{sid}.jsonl")), body).unwrap();
+        plant_emit_row(home, "2", "12121212", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Delivered);
+    }
+
+    /// The other direction: a second `/clear` in a session whose only clear
+    /// attachment belongs to the first one never landed, and counting it as
+    /// delivered hides exactly the loss this detector exists to measure.
+    #[test]
+    fn an_emission_with_only_older_attachments_is_missing() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let dir = projects_dir(home).join("-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "13131313-0000-0000-0000-000000000000";
+        let earlier = r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"the first brief"}"#;
+        std::fs::write(
+            dir.join(format!("{sid}.jsonl")),
+            format!("{}\n", transcript_line_at(sid, -30, 0, earlier)),
+        )
+        .unwrap();
+        plant_emit_row(home, "2", "13131313", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Missing);
     }
 
     #[test]
