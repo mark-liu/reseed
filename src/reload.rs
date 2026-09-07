@@ -567,16 +567,29 @@ fn deliver_stale(env: &Env, log_path: &Path, tier: &str, a: &sentinel::Arm) -> R
         .map(|d| d.as_secs() / 60)
         .unwrap_or(0);
     let key = key_of(a);
-    spawn::rearm(&key);
+    // Synchronous, then re-read: the bash prints what the sentinel says AFTER
+    // the re-arm, so a stale reload carries the re-distilled bundle rather
+    // than the one that went stale.
+    spawn::rearm_sync(&key);
+    let reload = a
+        .path
+        .parent()
+        .and_then(|pending| sentinel::read(pending, &key))
+        .map_or_else(|| a.reload.clone(), |fresh| fresh.reload);
     let head = msg::text("stale-head", STALE_HEAD_DEFAULT);
     fixed.push_str(&msg::fill(&head, &[("age", &age_mins.to_string())]));
     fixed.push('\n');
     let resume = msg::text("stale-resume", STALE_RESUME_DEFAULT);
-    fixed.push_str(&msg::fill(&resume, &[("reload", &a.reload)]));
+    // The bash interpolates `$(cat "$s")`, and command substitution eats every
+    // trailing newline; a re-armed sentinel has one.
+    fixed.push_str(&msg::fill(
+        &resume,
+        &[("reload", reload.trim_end_matches('\n'))],
+    ));
     fixed.push('\n');
     fixed.push_str(&msg::text("stale-unrelated", STALE_UNRELATED_DEFAULT));
     fixed.push('\n');
-    print!("{}", emit_capped(fixed, &a.reload, &key, env));
+    print!("{}", emit_capped(fixed, &reload, &key, env));
     log_row(env, log_path, tier, Some(&a.path), &gen.to_string());
     sentinel::remove(a);
     log_row(
