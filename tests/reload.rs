@@ -112,7 +112,7 @@ fn run_reload_with(home: &Path, ledger: &Path, messages: Option<&Path>) -> Strin
         .arg("reload")
         .env("HOME", home)
         .env("RESEED_PARK_LEDGER", ledger)
-        .env("RESEED_OPERATOR", "Mark")
+        .env("RESEED_OPERATOR", "Ada")
         .env_remove("CLAUDE_JOB_DIR")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("PWD")
@@ -223,7 +223,7 @@ fn a_message_override_replaces_the_compiled_text() {
     .unwrap();
     let out = run_reload_with(home, &short_ledger(home), Some(&messages));
 
-    assert!(out.contains("SITE BANNER for Mark, generation 1."));
+    assert!(out.contains("SITE BANNER for Ada, generation 1."));
     assert!(
         !out.contains("PROVENANCE (checked mechanically)"),
         "the override must replace the default, not sit beside it"
@@ -320,7 +320,7 @@ fn run_reload_in_job(home: &Path, ledger: &Path) -> String {
         .arg("reload")
         .env("HOME", home)
         .env("RESEED_PARK_LEDGER", ledger)
-        .env("RESEED_OPERATOR", "Mark")
+        .env("RESEED_OPERATOR", "Ada")
         .env("CLAUDE_JOB_DIR", home.join("jobs").join(JOB))
         .env_remove("RESEED_MESSAGES")
         .env_remove("CLAUDE_CODE_SESSION_ID")

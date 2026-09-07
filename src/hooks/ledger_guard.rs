@@ -174,36 +174,33 @@ mod tests {
 
     fn cases() -> Vec<(bool, &'static str)> {
         vec![
-            (true, "tail -8 ~/scratch/parked/host-b.md | cut -c1-400"),
-            (true, "sed -n '90,95p' ~/scratch/parked/host-b.md"),
-            (true, "cat $HOME/scratch/parked/host-b.md"),
-            (true, "head -20 ~/scratch/parked/host-a.md"),
+            (true, "tail -8 ~/scratch/parked/host-a.md | cut -c1-400"),
+            (true, "sed -n '90,95p' ~/scratch/parked/host-a.md"),
+            (true, "cat $HOME/scratch/parked/host-a.md"),
+            (true, "head -20 ~/scratch/parked/host-b.md"),
             (
                 true,
-                "tail -8 ~/scratch/parked/host-b.md | cut -c1-400 && echo done",
+                "tail -8 ~/scratch/parked/host-a.md | cut -c1-400 && echo done",
             ),
             (true, "less ~/scratch/parked/host-c.md"),
             (
                 false,
-                "grep -n -iE 'minio|3020' ~/scratch/parked/host-b.md | cut -c1-3000",
+                "grep -n -iE 'minio|3020' ~/scratch/parked/host-a.md | cut -c1-3000",
             ),
             (
                 false,
-                "tail -8 ~/scratch/parked/host-b.md | cut -c1-400  # ledger-survey",
+                "tail -8 ~/scratch/parked/host-a.md | cut -c1-400  # ledger-survey",
             ),
             (
                 false,
-                r#"echo "2026-08-27 | thing | resume: x" >> ~/scratch/parked/host-b.md"#,
+                r#"echo "2026-08-27 | thing | resume: x" >> ~/scratch/parked/host-a.md"#,
             ),
             (
                 false,
-                r#"git commit -m "note about ~/scratch/parked/host-b.md tail""#,
+                r#"git commit -m "note about ~/scratch/parked/host-a.md tail""#,
             ),
-            (
-                false,
-                "ssh host-a 'tail -8 ~/scratch/parked/host-a.md'",
-            ),
-            (false, "wc -l ~/scratch/parked/host-b.md"),
+            (false, "ssh host-b 'tail -8 ~/scratch/parked/host-b.md'"),
+            (false, "wc -l ~/scratch/parked/host-a.md"),
             (false, "ls -la ~/scratch/parked/"),
             (false, "tail -5 ~/scratch/notes.md"),
         ]
