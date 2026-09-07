@@ -215,7 +215,7 @@ pub fn run(p: Payload) -> i32 {
          then 'go')"
             .to_string()
     } else {
-        "! reseed-here then /clear then 'go' (no fresh bundle is armed, \
+        "! reseed-here then /clear then type 'go' (no fresh bundle is armed, \
          so distil first)"
             .to_string()
     };
