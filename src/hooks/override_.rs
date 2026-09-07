@@ -2,9 +2,16 @@
 //! reset halt. Ported from `reset-override.py`; P9 fail-open, P12 texts.
 
 use super::Payload;
-use crate::{paths, usage};
+use crate::{msg, paths, usage};
 use regex::Regex;
 use std::path::Path;
+
+/// Public-safe fallback (P12); a site overrides it through `$RESEED_MESSAGES`.
+const OVERRIDE_LIFTED_DEFAULT: &str =
+    "Reset halt LIFTED by {op} for this tier ({ctx}k, line {line}k). Tool calls work \
+     again. This is not a licence to start a fresh multi-step task: finish what they \
+     asked, keep the reply short, and say the reset is still owed. Crossing the next \
+     tier re-halts.";
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,10 +22,6 @@ fn phrase_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(r"(?i)\b(override reset|force past reset|ignore the reset|no clear)\b").unwrap()
     })
-}
-
-fn operator() -> String {
-    std::env::var("RESEED_OPERATOR").unwrap_or_else(|_| "Mark".to_string())
 }
 
 fn now_secs() -> f64 {
@@ -53,12 +56,13 @@ pub fn run(p: Payload) -> i32 {
         serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": format!(
-                    "Reset halt LIFTED by {op} for this tier ({ctx}k, line {line}k). Tool calls work \
-                     again. This is not a licence to start a fresh multi-step task: finish what he \
-                     asked, keep the reply short, and say the reset is still owed. Crossing the next \
-                     tier re-halts.",
-                    op = operator(), ctx = ctx / 1000, line = line / 1000,
+                "additionalContext": msg::fill(
+                    &msg::text("override-lifted", OVERRIDE_LIFTED_DEFAULT),
+                    &[
+                        ("op", &msg::operator()),
+                        ("ctx", &(ctx / 1000).to_string()),
+                        ("line", &(line / 1000).to_string()),
+                    ],
                 ),
             }
         })

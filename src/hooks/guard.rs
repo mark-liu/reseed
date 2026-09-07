@@ -2,13 +2,25 @@
 //! from `context-reset-guard.py`; P9 fail-open, P12 texts.
 
 use super::Payload;
-use crate::{paths, sentinel, spawn, usage};
+use crate::{msg, paths, sentinel, spawn, usage};
 use regex::Regex;
 use serde::Deserialize;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::thread::sleep;
+
+/// Public-safe fallbacks (P12). A site's own wording - including whatever
+/// incident made the rule matter there - belongs in `$RESEED_MESSAGES`.
+const GUARD_ARMED_DEFAULT: &str =
+    "reseed: context ~{ctx}k, halt at {line}k, {how} at the next natural break";
+
+const GUARD_PAST_LINE_DEFAULT: &str =
+    "context-reset-guard: context is ~{ctx}k, past the {line}k reset line, and your \
+     reply never told {op} to reset - that is how a reload gets buried, and the turn \
+     that would have carried it is lost. Re-send the SAME reply with one extra final \
+     line, after done:/next:, reading: 'RESET NOW ({ctx}k): {how}'. Do not restate \
+     anything else, do not start new work at this context size.";
 use std::time::{Duration, SystemTime};
 
 const SETTLE_FLOOR: Duration = Duration::from_millis(1500);
@@ -22,10 +34,6 @@ fn delivered_re() -> &'static Regex {
         Regex::new(r#"(?i)(/clear\b|reseed-here|reseed/clear|reset (?:the |this )?session|type ['"`]?go['"`]?\b)"#)
             .unwrap()
     })
-}
-
-fn operator() -> String {
-    std::env::var("RESEED_OPERATOR").unwrap_or_else(|_| "Mark".to_string())
 }
 
 fn wait_until_settled(path: &Path) {
@@ -169,9 +177,13 @@ pub fn run(p: Payload) -> i32 {
         println!(
             "{}",
             serde_json::json!({
-                "systemMessage": format!(
-                    "reseed: context ~{}k, halt at {}k, {} at the next natural break",
-                    ctx / 1000, line / 1000, how
+                "systemMessage": msg::fill(
+                    &msg::text("guard-armed", GUARD_ARMED_DEFAULT),
+                    &[
+                        ("ctx", &(ctx / 1000).to_string()),
+                        ("line", &(line / 1000).to_string()),
+                        ("how", &how),
+                    ],
                 )
             })
         );
@@ -208,16 +220,16 @@ pub fn run(p: Payload) -> i32 {
             .to_string()
     };
     eprintln!(
-        "context-reset-guard: context is ~{ctx}k, past the {line}k reset line, and your \
-         reply never told {op} to reset - that is exactly how a reload gets buried \
-         (one silently dropped, 129-min gap). Re-send the SAME reply \
-         with one extra final line, after done:/next:, reading: \
-         'RESET NOW ({ctx}k): {how}'. Do not restate anything else, do not start new \
-         work at this context size.",
-        ctx = ctx / 1000,
-        line = line / 1000,
-        op = operator(),
-        how = how,
+        "{}",
+        msg::fill(
+            &msg::text("guard-past-line", GUARD_PAST_LINE_DEFAULT),
+            &[
+                ("ctx", &(ctx / 1000).to_string()),
+                ("line", &(line / 1000).to_string()),
+                ("op", &msg::operator()),
+                ("how", &how),
+            ],
+        )
     );
     2
 }

@@ -2,13 +2,24 @@
 //! Ported from `context-reset-halt.py`; P9 fail-open, P12 texts.
 
 use super::Payload;
-use crate::{paths, sentinel, spawn, usage};
+use crate::{msg, paths, sentinel, spawn, usage};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn operator() -> String {
-    std::env::var("RESEED_OPERATOR").unwrap_or_else(|_| "Mark".to_string())
-}
+/// Public-safe fallback (P12); a site overrides it through `$RESEED_MESSAGES`.
+const HALT_DENY_DEFAULT: &str =
+    "HALTED: context is ~{ctx}k, past the {line}k reset line. Work done from here is \
+     not in the reload bundle, so the session pauses instead of advising. Tell {op}, \
+     in text, exactly where this task got to and what the next step is, then STOP and \
+     wait: they run /clear and type 'go' to continue in a fresh session with the \
+     narrative reloaded. The reload bundle is already armed or distilling in the \
+     background right now, so no `! reseed-here` is needed first. If the \
+     `rename-thread` skill never fired at the nudge tier, this thread still carries a \
+     stale title and no tool call can fix that now - so END your handoff text with a \
+     suggested title line (`suggested title: <3-6 words>`) that {op} can paste after \
+     /rename. Neither /clear nor `! reseed-here` is a tool call, so the way out is not \
+     blocked. Do NOT retry this call, do not route around it with another tool, and do \
+     not ask for the override - only {op} can lift it, by typing 'override reset'.";
 
 fn now_secs() -> f64 {
     SystemTime::now()
@@ -70,25 +81,13 @@ pub fn run(p: Payload) -> i32 {
         spawn::rearm(&session);
     }
 
-    let reason = format!(
-        "HALTED: context is ~{ctx}k, past the {line}k reset line. Work done from here \
-         is not in the reload bundle - a whole turn was lost this way, \
-         so the session pauses instead of advising. Tell {op}, in text, exactly where \
-         this task got to and what the next step is, then STOP and wait: he runs \
-         /clear and types 'go' to continue in a fresh session with the narrative \
-         reloaded. The reload bundle is already armed or distilling in the background \
-         right now, so no `! reseed-here` is needed first. \
-         If the `rename-thread` skill never fired at the nudge tier, this thread still \
-         carries a stale title and no tool call can fix that now - so END your handoff \
-         text with a suggested title line (`suggested title: <3-6 words>`) that {op} can \
-         paste after /rename. \
-         Neither /clear nor `! reseed-here` is a tool call, so the way out is \
-         not blocked. Do NOT retry this call, do not route around it with another tool, \
-         and do not ask for the override - only {op} can lift it, by typing \
-         'override reset'.",
-        ctx = ctx / 1000,
-        line = line / 1000,
-        op = operator(),
+    let reason = msg::fill(
+        &msg::text("halt-deny", HALT_DENY_DEFAULT),
+        &[
+            ("ctx", &(ctx / 1000).to_string()),
+            ("line", &(line / 1000).to_string()),
+            ("op", &msg::operator()),
+        ],
     );
     println!(
         "{}",

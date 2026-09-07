@@ -44,6 +44,36 @@ const STALE_RESUME_DEFAULT: &str = "If the first message resumes that work, or i
 const STALE_UNRELATED_DEFAULT: &str = "If it clearly opens an UNRELATED task, do NOT read the \
      bundle: answer what was asked and note the reload path above in one line.";
 
+const CWD_ONLY_HEAD_DEFAULT: &str = "A reseed reload is armed under this directory but was NOT \
+     auto-loaded. It is a {state} arm from job {job}; this session is job {thisjob}. A cwd match \
+     alone is not identity - every background job runs in this same directory, so the arm can \
+     belong to a different thread.";
+
+const CWD_ONLY_GEN_DEFAULT: &str = "That bundle is also generation {gen} of a reseed chain, so \
+     its subject was inherited rather than chosen.";
+
+const CWD_ONLY_DECIDE_DEFAULT: &str = "Nothing is lost - the arm stays on disk. If the first \
+     message resumes earlier work, or is just \"go\" / \"continue\", check the subject FIRST and \
+     only then decide:";
+
+const CWD_ONLY_UNRELATED_DEFAULT: &str = "If the first message opens an UNRELATED task, ignore \
+     the arm and answer what was asked.";
+
+const AMBIGUOUS_HEAD_DEFAULT: &str = "Reseed reloads are armed for {n} sessions under this \
+     directory, so none was auto-loaded (picking one could cross-load an unrelated session).";
+
+const AMBIGUOUS_PICK_DEFAULT: &str = "If the first message resumes earlier work, or is just \
+     \"go\" / \"continue\", pick by CONTENT, not by mtime: open each and keep the one whose last \
+     turns match the work being resumed. Mtime is a coin flip here - the newest arm is as likely \
+     to be a concurrent job's unrelated thread, and following it publishes one session's work \
+     under another's subject. Candidates:";
+
+const AMBIGUOUS_JOB_DEFAULT: &str = "This session is job {thisjob} - an arm from a DIFFERENT job \
+     is almost certainly not yours.";
+
+const AMBIGUOUS_UNRELATED_DEFAULT: &str = "If it opens an UNRELATED task, ignore them and answer \
+     what was asked.";
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Payload {
     pub session_id: Option<String>,
@@ -61,10 +91,6 @@ pub fn read_payload() -> Payload {
         return Payload::default();
     }
     serde_json::from_str(&buf).unwrap_or_default()
-}
-
-fn operator() -> String {
-    std::env::var("RESEED_OPERATOR").unwrap_or_else(|_| "Mark".to_string())
 }
 
 /// The session's request context: id, cwd, sanitised job id.
@@ -320,7 +346,10 @@ fn prov_banner(reload: &str) -> (u32, Option<String>) {
         return (0, None);
     }
     let template = msg::text("provenance", PROVENANCE_DEFAULT);
-    let text = msg::fill(&template, &[("gen", &gen.to_string()), ("op", &operator())]);
+    let text = msg::fill(
+        &template,
+        &[("gen", &gen.to_string()), ("op", &crate::msg::operator())],
+    );
     (gen, Some(format!("{text}\n\n")))
 }
 
@@ -578,26 +607,28 @@ fn report_cwd_only(env: &Env, log_path: &Path, a: &sentinel::Arm, state: &str) -
         .unwrap_or("none (foreground TUI)")
         .to_string();
     println!(
-        "A reseed reload is armed under this directory but was NOT auto-loaded. It is a {state} \
-         arm from job {sj}; this session is job {job_display}. A cwd match alone is not identity \
-         - every background job runs in this same directory, so the arm can belong to a \
-         different thread."
+        "{}",
+        msg::fill(
+            &msg::text("cwd-only-head", CWD_ONLY_HEAD_DEFAULT),
+            &[("state", state), ("job", &sj), ("thisjob", &job_display)],
+        )
     );
     if gen > 0 {
         println!(
-            "That bundle is also generation {gen} of a reseed chain, so its subject was \
-             inherited rather than chosen."
+            "{}",
+            msg::fill(
+                &msg::text("cwd-only-gen", CWD_ONLY_GEN_DEFAULT),
+                &[("gen", &gen.to_string())],
+            )
         );
     }
-    println!(
-        "Nothing is lost - the arm stays on disk. If the first message resumes earlier work, or \
-         is just \"go\" / \"continue\", check the subject FIRST and only then decide:"
-    );
+    println!("{}", msg::text("cwd-only-decide", CWD_ONLY_DECIDE_DEFAULT));
     if let Some(b) = &bundle {
         println!("  sed -n \"1,20p\" {}/narrative.md", b.display());
     }
     println!(
-        "If the first message opens an UNRELATED task, ignore the arm and answer what was asked."
+        "{}",
+        msg::text("cwd-only-unrelated", CWD_ONLY_UNRELATED_DEFAULT)
     );
     Ok(())
 }
@@ -605,17 +636,13 @@ fn report_cwd_only(env: &Env, log_path: &Path, a: &sentinel::Arm, state: &str) -
 /// Two or more same-root fresh candidates: named, never auto-loaded.
 fn report_ambiguous(env: &Env, log_path: &Path, cands: &[sentinel::Arm]) {
     println!(
-        "Reseed reloads are armed for {} sessions under this directory, so none was \
-         auto-loaded (picking one could cross-load an unrelated session).",
-        cands.len()
+        "{}",
+        msg::fill(
+            &msg::text("ambiguous-head", AMBIGUOUS_HEAD_DEFAULT),
+            &[("n", &cands.len().to_string())],
+        )
     );
-    println!(
-        "If the first message resumes earlier work, or is just \"go\" / \"continue\", pick by \
-         CONTENT, not by mtime: open each and keep the one whose last turns match the work being \
-         resumed. Mtime is a coin flip here - on 2026-08-12 the newest arm was a concurrent job's \
-         unrelated thread, and following it shipped a fleet-wide MR that belonged to the other \
-         session. Candidates:"
-    );
+    println!("{}", msg::text("ambiguous-pick", AMBIGUOUS_PICK_DEFAULT));
     for a in cands {
         let sj = a.job.clone().unwrap_or_else(|| "unknown".to_string());
         println!("  {} (job {sj}, armed {})", a.path.display(), armed_at(a));
@@ -625,7 +652,13 @@ fn report_ambiguous(env: &Env, log_path: &Path, cands: &[sentinel::Arm]) {
         .as_deref()
         .unwrap_or("none (foreground TUI)")
         .to_string();
-    println!("This session is job {job_display} - an arm from a DIFFERENT job is almost certainly not yours.");
+    println!(
+        "{}",
+        msg::fill(
+            &msg::text("ambiguous-job", AMBIGUOUS_JOB_DEFAULT),
+            &[("thisjob", &job_display)],
+        )
+    );
     log_row(
         env,
         log_path,
@@ -633,7 +666,10 @@ fn report_ambiguous(env: &Env, log_path: &Path, cands: &[sentinel::Arm]) {
         None,
         "-",
     );
-    println!("If it opens an UNRELATED task, ignore them and answer what was asked.");
+    println!(
+        "{}",
+        msg::text("ambiguous-unrelated", AMBIGUOUS_UNRELATED_DEFAULT)
+    );
 }
 
 /// HH:MM:SS the arm was written, in the operator's own timezone as the shell's

@@ -12,10 +12,6 @@ pub struct ArmOpts {
     pub pid: Option<u32>,
 }
 
-fn operator() -> String {
-    std::env::var("RESEED_OPERATOR").unwrap_or_else(|_| "Mark".to_string())
-}
-
 /// Arm the sentinel for `opts.sid` (or `$CLAUDE_CODE_SESSION_ID`). Returns
 /// the bundle directory on success.
 pub fn run(opts: ArmOpts) -> Result<PathBuf> {
@@ -147,7 +143,7 @@ pub fn reload_string(
          get a yes BEFORE any outward-facing write, because a resumed authorisation is not a live \
          authorisation.",
         bundle = bundle.display(),
-        op = operator(),
+        op = crate::msg::operator(),
     );
 
     let parkedstep = if ledger_present {
@@ -168,7 +164,7 @@ pub fn reload_string(
              survey, only when {op} asked what is parked: `tail -8 {ledger} | cut -c1-400  # \
              ledger-survey`.",
             ledger = ledger_path.display(),
-            op = operator(),
+            op = crate::msg::operator(),
         )
     } else {
         String::new()

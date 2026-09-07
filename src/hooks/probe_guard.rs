@@ -2,6 +2,7 @@
 //! Ported from `reseed-probe-guard.py`; P12 texts (no internal citations).
 
 use super::Payload;
+use crate::msg;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -129,7 +130,7 @@ pub fn run(p: Payload) -> i32 {
         return 0;
     }
     if is_parent_probe(&command) {
-        eprintln!("{RECIPE}");
+        eprintln!("{}", msg::text("probe-parent-listing", RECIPE));
         return 2;
     }
     0
