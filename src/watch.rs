@@ -1,9 +1,9 @@
-//! `reseed watch`: the reload DETECTOR, report only. Lists live sessions
-//! past the context line and audits whether recent reload emissions
-//! actually reached a context. Types nothing into any session (spec 11c);
-//! the keystroke path stays unbuilt.
+//! `reseed watch`: the reload detector. Lists live sessions past the
+//! context line and audits whether recent reload emissions actually
+//! reached a context. Report only by default; `--inject` hands the
+//! background ones to `inject`, which types `/clear` and `go` into them.
 
-use crate::{emit, paths, sentinel, usage};
+use crate::{emit, inject, paths, sentinel, usage};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -17,6 +17,8 @@ pub struct WatchOpts {
     pub since_days: Option<u64>,
     pub json: bool,
     pub log_path: Option<PathBuf>,
+    /// `Some` only when `--inject` was passed: the detector never types.
+    pub inject: Option<inject::InjectOpts>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,10 +93,15 @@ pub struct Report {
     pub sessions: Vec<SessionReport>,
     pub audit: Vec<AuditRow>,
     pub counts: AuditCounts,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<inject::Action>,
 }
 
 pub fn run(opts: WatchOpts) -> Result<()> {
-    let report = build_report(opts.since_days)?;
+    let mut report = build_report(opts.since_days)?;
+    if let Some(inject_opts) = &opts.inject {
+        report.actions = inject::run(inject_opts)?;
+    }
     let log_path = match opts.log_path {
         Some(p) => p,
         None => paths::watch_log()?,
@@ -138,6 +145,13 @@ fn print_text(report: &Report) {
             a.verdict.as_str()
         );
     }
+    if !report.actions.is_empty() {
+        println!();
+        println!("Injection:");
+        for a in &report.actions {
+            println!("  {} job={} {} ({})", a.sid8, a.job, a.did, a.why);
+        }
+    }
     println!(
         "counts: delivered={} cancelled={} persisted={} missing={} unknown={} total={}",
         report.counts.delivered,
@@ -177,6 +191,13 @@ fn append_log(log_path: &Path, report: &Report) -> Result<()> {
             a.sid8,
             a.verdict.as_str(),
             a.tier,
+        )?;
+    }
+    for a in &report.actions {
+        writeln!(
+            f,
+            "{ts}\t{}\t\tinject\tjob={}\t{}\t{}",
+            a.sid8, a.job, a.did, a.why,
         )?;
     }
     Ok(())
@@ -227,6 +248,7 @@ fn build_report(since_days: Option<u64>) -> Result<Report> {
         sessions,
         audit,
         counts,
+        actions: Vec::new(),
     })
 }
 
@@ -287,6 +309,47 @@ fn live_sessions_past_line() -> Result<Vec<SessionReport>> {
     }
     out.sort_by(|a, b| a.sid8.cmp(&b.sid8));
     Ok(out)
+}
+
+/// Live background sessions as `(session id, job short id)`. The job id is
+/// the handle the daemon control socket addresses, so a terminal session
+/// (no job id) is not injectable and is left out.
+pub fn live_bg_sessions() -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(paths::sessions_dir()?) else {
+        return Ok(out);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(reg) = serde_json::from_str::<RegistryEntry>(&body) else {
+            continue;
+        };
+        let (Some(sid), Some(job)) = (
+            reg.session_id.filter(|s| !s.is_empty()),
+            reg.job_id.filter(|j| !j.is_empty()),
+        ) else {
+            continue;
+        };
+        out.push((sid, job));
+    }
+    out.sort();
+    Ok(out)
+}
+
+pub fn transcript_for(projects_dir: &Path, sid: &str) -> Option<PathBuf> {
+    find_transcript(projects_dir, sid)
+}
+
+/// Did the reload this emit row describes actually reach a context? The
+/// injector gates `go` on this, the audit reports it.
+pub fn delivered(projects_dir: &Path, sid8: &str, row_secs: u64) -> bool {
+    classify(projects_dir, sid8, row_secs) == Verdict::Delivered
 }
 
 /// A transcript whose filename stem is exactly `sid` (session ids are full
@@ -801,6 +864,7 @@ mod tests {
                 since_days: None,
                 json: true,
                 log_path: None,
+                inject: None,
             })
             .unwrap()
         });
