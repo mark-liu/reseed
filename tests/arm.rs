@@ -80,6 +80,58 @@ fn cwd_job_pid_sidecars_are_written() {
     assert!(pending.join("sid1").exists());
 }
 
+fn plant_registry(home: &std::path::Path, pid: u32, sid: &str) {
+    let dir = home.join(".claude/sessions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{pid}.json")),
+        format!(r#"{{"pid":{pid},"sessionId":"{sid}","cwd":"/x"}}"#),
+    )
+    .unwrap();
+}
+
+/// P7 finding 7: without this the sidecar named the `reseed` process, which
+/// exits in seconds, so tier 1b could never match a live session.
+#[test]
+fn the_pid_sidecar_names_the_session_not_this_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    plant_transcript(tmp.path(), "sid7");
+    plant_registry(tmp.path(), 9999, "sid7");
+    let out = run_arm(tmp.path(), "sid7", true);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pid =
+        fs::read_to_string(tmp.path().join(".claude/reseed/pending").join("sid7.pid")).unwrap();
+    assert_eq!(pid, "9999");
+}
+
+/// `RESEED_PID` outranks the registry: spec 3 lists it as the override for
+/// a session the registry has not caught up with.
+#[test]
+fn reseed_pid_overrides_the_registry() {
+    let tmp = tempfile::tempdir().unwrap();
+    plant_transcript(tmp.path(), "sid8");
+    plant_registry(tmp.path(), 9999, "sid8");
+    let out = bin()
+        .args(["arm", "--sid", "sid8", "--quiet"])
+        .env("HOME", tmp.path())
+        .env("RESEED_PID", "5150")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pid =
+        fs::read_to_string(tmp.path().join(".claude/reseed/pending").join("sid8.pid")).unwrap();
+    assert_eq!(pid, "5150");
+}
+
 #[test]
 fn quiet_prints_nothing_on_stdout() {
     let tmp = tempfile::tempdir().unwrap();
