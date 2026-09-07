@@ -68,7 +68,7 @@ fn run_with_messages(
     cmd.arg("reload")
         .env("HOME", home)
         .env("PWD", cwd)
-        .env("RESEED_OPERATOR", "Mark")
+        .env("RESEED_OPERATOR", "Ada")
         .env_remove("CLAUDE_CODE_SESSION_ID");
     match messages {
         Some(d) => cmd.env("RESEED_MESSAGES", d),
@@ -523,7 +523,7 @@ fn run_tz(home: &Path, tz: &str) -> String {
         .env("HOME", home)
         .env("PWD", "/work")
         .env("TZ", tz)
-        .env("RESEED_OPERATOR", "Mark")
+        .env("RESEED_OPERATOR", "Ada")
         .env_remove("RESEED_MESSAGES")
         .env_remove("RESEED_PARK_LEDGER")
         .env_remove("CLAUDE_JOB_DIR")

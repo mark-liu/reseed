@@ -166,7 +166,7 @@ mod tests {
                 false,
             ),
             ("ls -la ~/scratch/", false),
-            ("ssh partly 'ls -la ~/.claude/reseed/'", false),
+            ("ssh host-b 'ls -la ~/.claude/reseed/'", false),
             (
                 r#"git commit -q -m "blocks a parent listing of the reseed dir" -- scripts/x.py"#,
                 false,
@@ -208,7 +208,7 @@ mod tests {
     fn ssh_prefixed_command_bypasses_the_guard_at_run_level() {
         let p = Payload {
             tool_input: super::super::ToolInput {
-                command: Some("ssh partly 'ls -la ~/.claude/reseed/'".to_string()),
+                command: Some("ssh host-b 'ls -la ~/.claude/reseed/'".to_string()),
             },
             ..Default::default()
         };

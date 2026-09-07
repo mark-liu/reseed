@@ -174,36 +174,33 @@ mod tests {
 
     fn cases() -> Vec<(bool, &'static str)> {
         vec![
-            (true, "tail -8 ~/scratch/parked/bender.md | cut -c1-400"),
-            (true, "sed -n '90,95p' ~/scratch/parked/bender.md"),
-            (true, "cat $HOME/scratch/parked/bender.md"),
-            (true, "head -20 ~/scratch/parked/Mark-Partly.md"),
+            (true, "tail -8 ~/scratch/parked/host-a.md | cut -c1-400"),
+            (true, "sed -n '90,95p' ~/scratch/parked/host-a.md"),
+            (true, "cat $HOME/scratch/parked/host-a.md"),
+            (true, "head -20 ~/scratch/parked/host-b.md"),
             (
                 true,
-                "tail -8 ~/scratch/parked/bender.md | cut -c1-400 && echo done",
+                "tail -8 ~/scratch/parked/host-a.md | cut -c1-400 && echo done",
             ),
-            (true, "less ~/scratch/parked/TS-Mac-Mli.md"),
+            (true, "less ~/scratch/parked/host-c.md"),
             (
                 false,
-                "grep -n -iE 'minio|3020' ~/scratch/parked/bender.md | cut -c1-3000",
-            ),
-            (
-                false,
-                "tail -8 ~/scratch/parked/bender.md | cut -c1-400  # ledger-survey",
+                "grep -n -iE 'minio|3020' ~/scratch/parked/host-a.md | cut -c1-3000",
             ),
             (
                 false,
-                r#"echo "2026-08-27 | thing | resume: x" >> ~/scratch/parked/bender.md"#,
+                "tail -8 ~/scratch/parked/host-a.md | cut -c1-400  # ledger-survey",
             ),
             (
                 false,
-                r#"git commit -m "note about ~/scratch/parked/bender.md tail""#,
+                r#"echo "2026-08-27 | thing | resume: x" >> ~/scratch/parked/host-a.md"#,
             ),
             (
                 false,
-                "ssh partly 'tail -8 ~/scratch/parked/Mark-Partly.md'",
+                r#"git commit -m "note about ~/scratch/parked/host-a.md tail""#,
             ),
-            (false, "wc -l ~/scratch/parked/bender.md"),
+            (false, "ssh host-b 'tail -8 ~/scratch/parked/host-b.md'"),
+            (false, "wc -l ~/scratch/parked/host-a.md"),
             (false, "ls -la ~/scratch/parked/"),
             (false, "tail -5 ~/scratch/notes.md"),
         ]
