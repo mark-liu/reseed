@@ -433,6 +433,11 @@ fn classify(projects_dir: &Path, sid8: &str, row_secs: u64) -> Verdict {
             att.content.as_deref().unwrap_or(""),
             att.stdout.as_deref().unwrap_or(""),
         );
+        // An attachment that carried no text is not evidence of a delivery;
+        // the emission's real outcome, if any, is a later attachment.
+        if body.is_empty() {
+            continue;
+        }
         if body.contains("<persisted-output>") {
             return Verdict::Persisted;
         }
@@ -655,6 +660,48 @@ mod tests {
         plant_emit_row(home, "2", "13131313", 0);
         let audit = audit_over(home);
         assert_eq!(audit[0].verdict, Verdict::Missing);
+    }
+
+    /// `hook_non_blocking_error` attachments carry no body (1 of 366 on this
+    /// host). Reading one as a delivery credits the emission with text that
+    /// never reached a context, the exact loss this detector measures.
+    #[test]
+    fn an_attachment_with_no_body_is_not_a_delivery() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let dir = projects_dir(home).join("-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "14141414-0000-0000-0000-000000000000";
+        let empty = r#"{"type":"hook_non_blocking_error","hookName":"SessionStart:clear"}"#;
+        std::fs::write(
+            dir.join(format!("{sid}.jsonl")),
+            format!("{}\n", transcript_line_at(sid, 5, 755, empty)),
+        )
+        .unwrap();
+        plant_emit_row(home, "2", "14141414", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Missing);
+    }
+
+    /// The same empty attachment ahead of a real one must not swallow it.
+    #[test]
+    fn an_empty_attachment_does_not_hide_the_delivery_behind_it() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let dir = projects_dir(home).join("-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = "15151515-0000-0000-0000-000000000000";
+        let empty = r#"{"type":"hook_non_blocking_error","hookName":"SessionStart:clear"}"#;
+        let real = r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"Read the bundle"}"#;
+        let body = format!(
+            "{}\n{}\n",
+            transcript_line_at(sid, 5, 755, empty),
+            transcript_line_at(sid, 6, 651, real)
+        );
+        std::fs::write(dir.join(format!("{sid}.jsonl")), body).unwrap();
+        plant_emit_row(home, "2", "15151515", 0);
+        let audit = audit_over(home);
+        assert_eq!(audit[0].verdict, Verdict::Delivered);
     }
 
     #[test]
