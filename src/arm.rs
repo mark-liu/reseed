@@ -111,6 +111,14 @@ pub fn run(opts: ArmOpts) -> Result<PathBuf> {
     Ok(bundle_dir)
 }
 
+/// Public-safe default. A harness with its own paging ceiling and turn-mapping
+/// recipe states them in `readverb-long.txt`, which this crate never carries.
+const READVERB_LONG_DEFAULT: &str = "in <=600-line chunks with offset until EOF ({lines} lines; \
+     one bare read of a file this size can silently return a partial view that misses the tail, and \
+     a larger limit makes it worse. Map the turn boundaries first, then read the LAST \
+     user+assistant pair, and skip multi-thousand-line gaps between markers, which are inlined \
+     skill payloads. The FINAL lines of the file are usually a skill payload, not the last turn)";
+
 /// Build the reload instruction: `readverb` (P6/P7-agnostic), a provenance
 /// step, and a park-ledger step when the ledger is non-empty.
 pub fn reload_string(
@@ -120,13 +128,9 @@ pub fn reload_string(
     ledger_path: &std::path::Path,
 ) -> String {
     let readverb = if lines > 900 {
-        format!(
-            "in <=600-line chunks with offset until EOF ({lines} lines; the Read tool caps at 25k \
-             TOKENS and silently returns a PARTIAL view, so ONE bare Read misses the tail and a \
-             larger limit makes it worse. Map turn boundaries FIRST with awk, never grep. Then read \
-             the LAST user+assistant pair, and skip multi-thousand-line gaps between markers, which \
-             are inlined skill payloads. The FINAL lines of the file are usually a skill payload, not \
-             the last turn)"
+        crate::msg::fill(
+            &crate::msg::text("readverb-long", READVERB_LONG_DEFAULT),
+            &[("lines", &lines.to_string())],
         )
     } else {
         format!("in full ({lines} lines)")
@@ -191,8 +195,50 @@ mod tests {
 
     #[test]
     fn long_narrative_uses_chunked_readverb() {
-        let s = reload_string(Path::new("/b"), 901, false, Path::new("/l"));
+        let s = with_messages(None, || {
+            reload_string(Path::new("/b"), 901, false, Path::new("/l"))
+        });
         assert!(s.contains("<=600-line chunks"));
+        assert!(s.contains("(901 lines;"));
+    }
+
+    /// The crate is public: the compiled fallback states the shape of the
+    /// problem, never this site's measured ceiling or its tooling.
+    #[test]
+    fn the_default_readverb_names_no_site_doctrine() {
+        let s = with_messages(None, || {
+            reload_string(Path::new("/b"), 901, false, Path::new("/l"))
+        });
+        for leak in ["25k", "ugrep", "awk", "Read tool"] {
+            // leak-ok: names what must be absent
+            assert!(!s.contains(leak), "default readverb leaks {leak:?}");
+        }
+    }
+
+    #[test]
+    fn a_site_readverb_wins_and_gets_its_line_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("readverb-long.txt"),
+            "the site way ({lines} lines)\n",
+        )
+        .unwrap();
+        let s = with_messages(Some(tmp.path()), || {
+            reload_string(Path::new("/b"), 901, false, Path::new("/l"))
+        });
+        assert!(s.contains("the site way (901 lines)"), "got: {s}");
+        assert!(!s.contains("<=600-line chunks"));
+    }
+
+    /// `None` points at an empty directory rather than unsetting the variable:
+    /// this host has real message files, and the default must be tested.
+    fn with_messages<T>(dir: Option<&Path>, f: impl FnOnce() -> T) -> T {
+        let empty = tempfile::tempdir().unwrap();
+        let _held = crate::testlock::env_lock();
+        std::env::set_var("RESEED_MESSAGES", dir.unwrap_or(empty.path()));
+        let out = f();
+        std::env::remove_var("RESEED_MESSAGES");
+        out
     }
 
     #[test]
