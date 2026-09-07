@@ -158,7 +158,12 @@ fn main() -> Result<()> {
             if quiet {
                 Ok(())
             } else {
+                // Same two lines `distill` prints: the bash arm shells out to it.
                 println!("Bundle written to {}", dir.display());
+                println!(
+                    "Reseed with:  claude  then  \"Read {}/narrative.md and continue\"",
+                    dir.display()
+                );
                 Ok(())
             }
         }
