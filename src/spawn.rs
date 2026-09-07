@@ -10,22 +10,39 @@ use std::process::{Command, Stdio};
 /// parent is the Claude process, while the detached child's own pid is a
 /// process that exits in seconds and can never match tier 1b (P7).
 pub fn rearm(sid: &str) -> bool {
-    let Ok(exe) = std::env::current_exe() else {
+    let Some(mut cmd) = arm_command(sid) else {
         return false;
     };
-    let Ok(home) = crate::paths::home() else {
+    cmd.process_group(0) // own group: must outlive the calling hook's exit
+        .spawn()
+        .is_ok()
+}
+
+/// Run `reseed arm --quiet` for `sid` and WAIT for it. True if it exited 0.
+///
+/// The stale reload path needs the wait: the bash re-arms synchronously and
+/// then prints what the sentinel says afterwards, so a detached spawn would
+/// print the arm that went stale and drop the fresh one in after the remove.
+pub fn rearm_sync(sid: &str) -> bool {
+    let Some(mut cmd) = arm_command(sid) else {
         return false;
     };
-    Command::new(exe)
-        .args(arm_args(crate::identity::session_pid(sid)))
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// The re-arm invocation both callers share, or `None` when this process
+/// cannot name itself or its home.
+fn arm_command(sid: &str) -> Option<Command> {
+    let exe = std::env::current_exe().ok()?;
+    let home = crate::paths::home().ok()?;
+    let mut cmd = Command::new(exe);
+    cmd.args(arm_args(crate::identity::session_pid(sid)))
         .env("CLAUDE_CODE_SESSION_ID", sid)
         .current_dir(home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0) // own group: must outlive the calling hook's exit
-        .spawn()
-        .is_ok()
+        .stderr(Stdio::null());
+    Some(cmd)
 }
 
 /// The `arm` argv, with `--pid` only when a session pid resolved: passing
