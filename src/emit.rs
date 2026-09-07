@@ -165,6 +165,8 @@ fn parse_full_row(line: &str) -> Option<LogRow> {
 
 /// Seconds since the Unix epoch for a `%FT%TZ` timestamp. Public so callers
 /// windowing `emit.log` (the `watch` audit's `--since`) share this parser.
+/// Transcript lines stamp milliseconds on the same shape, so a fractional
+/// second is dropped rather than rejected.
 pub fn parse_ts_secs(ts: &str) -> Option<u64> {
     // %FT%TZ, e.g. 2026-09-05T13:05:00Z. Parsed by hand to avoid a chrono dep.
     let ts = ts.strip_suffix('Z')?;
@@ -176,11 +178,13 @@ pub fn parse_ts_secs(ts: &str) -> Option<u64> {
         d.next()?.parse().ok()?,
     );
     let mut t = time.split(':');
-    let (h, mi, s): (u64, u64, u64) = (
-        t.next()?.parse().ok()?,
-        t.next()?.parse().ok()?,
-        t.next()?.parse().ok()?,
-    );
+    let (h, mi): (u64, u64) = (t.next()?.parse().ok()?, t.next()?.parse().ok()?);
+    let sec = t.next()?;
+    let s: u64 = sec
+        .split_once('.')
+        .map_or(sec, |(whole, _)| whole)
+        .parse()
+        .ok()?;
     let days = days_from_civil(y, mo, day);
     Some(days as u64 * 86_400 + h * 3600 + mi * 60 + s)
 }
@@ -199,6 +203,18 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Transcript lines stamp milliseconds; the `watch` audit correlates
+    /// them against whole-second `emit.log` rows through this one parser.
+    #[test]
+    fn a_fractional_second_parses_to_the_same_whole_second() {
+        let whole = parse_ts_secs("2026-08-30T22:17:28Z").unwrap();
+        assert_eq!(parse_ts_secs("2026-08-30T22:17:28.651Z"), Some(whole));
+        assert_eq!(parse_ts_secs("2026-08-30T22:17:28.000Z"), Some(whole));
+        // The fraction is never read, so only the whole second is validated.
+        assert_eq!(parse_ts_secs("2026-08-30T22:17:28.xyzZ"), Some(whole));
+        assert_eq!(parse_ts_secs("2026-08-30T22:17:xxZ"), None);
+    }
 
     #[test]
     fn log_writes_a_tsv_row() {
