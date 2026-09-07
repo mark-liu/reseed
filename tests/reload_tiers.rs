@@ -86,6 +86,58 @@ fn run(home: &Path, sid: &str, cwd: &str, job: Option<&str>, ledger: Option<&Pat
     String::from_utf8(out.stdout).expect("stdout is valid UTF-8")
 }
 
+/// The `.pid` sidecar plus the registry entry that has to agree with it for
+/// tier 1b to fire.
+fn arm_for_pid(home: &Path, key: &str, cwd: &str, pid: u32, stale: bool) -> PathBuf {
+    let s = arm(home, key, cwd, stale, None);
+    fs::write(pending(home).join(format!("{key}.pid")), pid.to_string()).unwrap();
+    s
+}
+
+fn registry(home: &Path, pid: u32, sid: &str) {
+    let dir = home.join(".claude/sessions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{pid}.json")),
+        format!(r#"{{"pid":{pid},"sessionId":"{sid}","cwd":"/x"}}"#),
+    )
+    .unwrap();
+}
+
+// --- tier 1b: the pid identity tier (P7) -------------------------------------
+
+/// A foreground `/clear` mints a new session id in the same process, so the
+/// arm is keyed under the old id and only the pid still connects them.
+#[test]
+fn tier1b_fresh_pid_match_reloads_raw() {
+    let t = home();
+    registry(t.path(), 4242, "new-sid");
+    arm_for_pid(t.path(), "old-sid", "/elsewhere", 4242, false);
+    let out = run(t.path(), "new-sid", "/work", None, None);
+    assert!(out.contains("old-sid/narrative.md"), "got: {out}");
+    assert!(!out.contains(STALE_MARKER));
+}
+
+#[test]
+fn tier1b_stale_pid_match_reloads_behind_the_opt_out() {
+    let t = home();
+    registry(t.path(), 4242, "new-sid");
+    arm_for_pid(t.path(), "old-sid", "/elsewhere", 4242, true);
+    let out = run(t.path(), "new-sid", "/work", None, None);
+    assert!(out.contains(STALE_MARKER), "got: {out}");
+    assert!(out.contains(OPT_OUT_MARKER), "got: {out}");
+}
+
+/// Two Claude processes on one machine each own arms; matching on the pid
+/// alone would hand one session the other's bundle.
+#[test]
+fn tier1b_ignores_another_sessions_pid() {
+    let t = home();
+    registry(t.path(), 4242, "new-sid");
+    arm_for_pid(t.path(), "old-sid", "/elsewhere", 5150, false);
+    assert_eq!(run(t.path(), "new-sid", "/work", None, None), "");
+}
+
 // --- unarmed -----------------------------------------------------------------
 
 #[test]

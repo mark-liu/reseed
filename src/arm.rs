@@ -2,7 +2,7 @@
 //! reload string, then write the sentinel and its sidecars atomically
 //! (sentinel last, P6). Ported from `reseed-here`.
 
-use crate::{atomic, paths, sentinel};
+use crate::{atomic, identity, paths, sentinel};
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
@@ -81,7 +81,13 @@ pub fn run(opts: ArmOpts) -> Result<PathBuf> {
             atomic::write(&pending.join(format!("{key}.job")), job.as_bytes())?;
         }
     }
-    let pid = opts.pid.unwrap_or_else(std::process::id);
+    // P7: the sidecar must name the session's process. Never the parent:
+    // on the detached rearm path that is the hook, not Claude.
+    let pid = opts
+        .pid
+        .or_else(|| std::env::var("RESEED_PID").ok()?.parse().ok())
+        .or_else(|| identity::registry_pid(&sid))
+        .unwrap_or_else(std::process::id);
     atomic::write(
         &pending.join(format!("{key}.pid")),
         pid.to_string().as_bytes(),

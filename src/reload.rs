@@ -2,7 +2,7 @@
 //! reload text on stdout. Ported from `reseed-clear-hook.sh` and the tier
 //! semantics in `reseed-clear-hook.md`. Fails open: never exits non-zero.
 
-use crate::{emit, msg, park, paths, sentinel, spawn};
+use crate::{emit, identity, msg, park, paths, sentinel, spawn};
 use anyhow::Result;
 use regex::Regex;
 use serde::Deserialize;
@@ -123,7 +123,7 @@ pub fn run(payload: Payload) -> Result<()> {
 
     // Tier 1b (P7): fresh sentinel whose .pid sidecar is this session's pid.
     if let Some(sid) = env.sid.as_deref() {
-        if let Some(pid) = identity_pid(sid) {
+        if let Some(pid) = identity::session_pid(sid) {
             let mut fresh: Option<sentinel::Arm> = None;
             let mut stale: Option<sentinel::Arm> = None;
             for a in sentinel::list(&pending) {
@@ -268,41 +268,6 @@ fn belongs_to_job(a: &sentinel::Arm, jobid: &str) -> bool {
             .and_then(|n| n.to_str())
             .is_some_and(|name| name.starts_with(jobid)),
     }
-}
-
-/// This session's own pid: the registry entry whose `sessionId` matches,
-/// falling back to this process's parent pid.
-fn identity_pid(sid: &str) -> Option<u32> {
-    registry_pid(sid).or_else(parent_pid)
-}
-
-fn registry_pid(sid: &str) -> Option<u32> {
-    let dir = paths::sessions_dir().ok()?;
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(body) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
-            continue;
-        };
-        if v.get("sessionId").and_then(|s| s.as_str()) == Some(sid) {
-            return path.file_stem().and_then(|s| s.to_str())?.parse().ok();
-        }
-    }
-    None
-}
-
-fn parent_pid() -> Option<u32> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 fn bundle_re() -> &'static Regex {

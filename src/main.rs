@@ -18,6 +18,7 @@ mod defang;
 mod distill;
 mod emit;
 mod hooks;
+mod identity;
 mod msg;
 mod park;
 mod parse;
