@@ -2,9 +2,34 @@
 //! Ported from `context-reseed-nudge.py`; P9 fail-open, P12 texts.
 
 use super::Payload;
-use crate::{paths, sentinel, spawn, usage};
+use crate::{msg, paths, sentinel, spawn, usage};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Public-safe fallbacks (P12); a site overrides any of them through
+/// `$RESEED_MESSAGES`.
+const NUDGE_EARLY_BANNER_DEFAULT: &str =
+    "reseed-nudge: context ~{ctx}k, {pct}% of {line}k - bundle arming, /clear then 'go' \
+     before the halt";
+
+const NUDGE_EARLY_DEFAULT: &str =
+    "Context is at ~{ctx}k tokens, {pct}% of the {line}k yellow line, and every tool \
+     call is DENIED at {line}k. Reset now, while it is cheap. FIRST invoke the \
+     `rename-thread` skill (after /clear no title can be derived). Then advise {op}: \
+     {step} Do not tell them to run `! reseed-here` first. Finish only a near-done \
+     step; do not start new multi-step work at this size.";
+
+const NUDGE_TIER_BANNER_DEFAULT: &str =
+    "reseed-nudge: context ~{ctx}k > {line}k - reseed/clear recommended";
+
+const NUDGE_TIER_DEFAULT: &str =
+    "Context is at ~{ctx}k tokens (yellow line {line}k). This session is past its reset \
+     point - every further turn pays a latency and recall tax. FIRST invoke the \
+     `rename-thread` skill - after /clear the conversation is gone, so this is the LAST \
+     moment a title can be derived from what this session actually did, and the /resume \
+     picker entry is all a future session has to find it by. Then advise {op}: {step} \
+     For a new task just /clear. Finish only a near-done step first; do not start new \
+     multi-step work at this context size.";
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const REARM_INTERVAL_SECS: f64 = 480.0;
@@ -17,10 +42,6 @@ struct State {
     armed_at: f64,
     #[serde(default)]
     early: bool,
-}
-
-fn operator() -> String {
-    std::env::var("RESEED_OPERATOR").unwrap_or_else(|_| "Mark".to_string())
 }
 
 fn now_secs() -> f64 {
@@ -106,18 +127,27 @@ pub fn run(p: Payload) -> i32 {
              `! reseed-here` then /clear then 'go'."
                 .to_string()
         };
-        let early_msg = format!(
-            "Context is at ~{ctx_k}k tokens, {pct}% of the {line_k}k yellow line, and every \
-             tool call is DENIED at {line_k}k. Reset now, while it is cheap. FIRST invoke the \
-             `rename-thread` skill (after /clear no title can be derived). Then advise {op}: \
-             {reset_step} Do not tell him to run `! reseed-here` first. Finish only a \
-             near-done step; do not start new multi-step work at this size.",
-            op = operator()
+        let early_msg = msg::fill(
+            &msg::text("nudge-early", NUDGE_EARLY_DEFAULT),
+            &[
+                ("ctx", &ctx_k.to_string()),
+                ("pct", &pct.to_string()),
+                ("line", &line_k.to_string()),
+                ("op", &msg::operator()),
+                ("step", &reset_step),
+            ],
         );
         println!(
             "{}",
             serde_json::json!({
-                "systemMessage": format!("reseed-nudge: context ~{ctx_k}k, {pct}% of {line_k}k - bundle arming, /clear then 'go' before the halt"),
+                "systemMessage": msg::fill(
+                    &msg::text("nudge-early-banner", NUDGE_EARLY_BANNER_DEFAULT),
+                    &[
+                        ("ctx", &ctx_k.to_string()),
+                        ("pct", &pct.to_string()),
+                        ("line", &line_k.to_string()),
+                    ],
+                ),
                 "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": early_msg},
             })
         );
@@ -144,21 +174,22 @@ pub fn run(p: Payload) -> i32 {
          back to `! reseed-here` then /clear then 'go'."
             .to_string()
     };
-    let ctx_msg = format!(
-        "Context is at ~{ctx_k}k tokens (yellow line {line_k}k). Per Long Session \
-         Hygiene this session is past its reset point - every further turn pays a \
-         latency and recall tax. FIRST invoke the `rename-thread` skill - after \
-         /clear the conversation is gone, so this is the LAST moment a title can be \
-         derived from what this session actually did, and the /resume picker entry is \
-         all a future session has to find it by. Then advise {op}: {reset_step} For a new task just \
-         /clear. Finish only a near-done step first; do not start new multi-step \
-         work at this context size.",
-        op = operator()
+    let ctx_msg = msg::fill(
+        &msg::text("nudge-tier", NUDGE_TIER_DEFAULT),
+        &[
+            ("ctx", &ctx_k.to_string()),
+            ("line", &line_k.to_string()),
+            ("op", &msg::operator()),
+            ("step", &reset_step),
+        ],
     );
     println!(
         "{}",
         serde_json::json!({
-            "systemMessage": format!("reseed-nudge: context ~{ctx_k}k > {line_k}k - reseed/clear recommended"),
+            "systemMessage": msg::fill(
+                &msg::text("nudge-tier-banner", NUDGE_TIER_BANNER_DEFAULT),
+                &[("ctx", &ctx_k.to_string()), ("line", &line_k.to_string())],
+            ),
             "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": ctx_msg},
         })
     );

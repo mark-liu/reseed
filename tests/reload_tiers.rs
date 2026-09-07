@@ -53,13 +53,27 @@ fn arm(home: &Path, key: &str, cwd: &str, stale: bool, body: Option<&str>) -> Pa
 
 /// Invoke `reload` with a SessionStart payload on stdin and a clean env.
 fn run(home: &Path, sid: &str, cwd: &str, job: Option<&str>, ledger: Option<&Path>) -> String {
+    run_with_messages(home, sid, cwd, job, ledger, None)
+}
+
+fn run_with_messages(
+    home: &Path,
+    sid: &str,
+    cwd: &str,
+    job: Option<&str>,
+    ledger: Option<&Path>,
+    messages: Option<&Path>,
+) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_reseed"));
     cmd.arg("reload")
         .env("HOME", home)
         .env("PWD", cwd)
         .env("RESEED_OPERATOR", "Mark")
-        .env_remove("RESEED_MESSAGES")
         .env_remove("CLAUDE_CODE_SESSION_ID");
+    match messages {
+        Some(d) => cmd.env("RESEED_MESSAGES", d),
+        None => cmd.env_remove("RESEED_MESSAGES"),
+    };
     match job {
         Some(j) => cmd.env("CLAUDE_JOB_DIR", j),
         None => cmd.env_remove("CLAUDE_JOB_DIR"),
@@ -272,6 +286,24 @@ fn tier3_ambiguous_surfaces_the_candidates() {
     assert!(out.contains(&pending(h.path()).join("a").display().to_string()));
     assert!(out.contains(&pending(h.path()).join("b").display().to_string()));
     assert!(out.contains(OPT_OUT_MARKER));
+}
+
+/// The site name is the whole wiring: a typo in it fails silently forever,
+/// shipping the generic default while the operator edits a file nobody reads.
+#[test]
+fn the_ambiguous_report_reads_its_site_override() {
+    let h = home();
+    let msgs = tempfile::tempdir().unwrap();
+    fs::write(
+        msgs.path().join("ambiguous-pick.txt"),
+        "SITE RULE: pick by content, never by mtime.\n",
+    )
+    .unwrap();
+    arm(h.path(), "a", "/work", false, None);
+    arm(h.path(), "b", "/work", false, None);
+    let out = run_with_messages(h.path(), "new-id", "/work", None, None, Some(msgs.path()));
+    assert!(out.contains("SITE RULE: pick by content"), "got: {out}");
+    assert!(!out.contains("Mtime is a coin flip"), "default still shown");
 }
 
 #[test]

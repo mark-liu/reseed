@@ -282,7 +282,7 @@ fn test_phrase_past_the_line_arms_this_tier() {
     let (rc, out) = run("override", tmp.path(), &payload, &[]);
     assert_eq!(rc, 0);
     assert_eq!(marker(tmp.path(), SESSION).unwrap()["tier"], 1);
-    assert!(out.contains("LIFTED by Mark for this tier (317k"));
+    assert!(out.contains("LIFTED by the operator for this tier (317k"));
     assert_eq!(halt(tmp.path(), Some(&t), SESSION, &[]), (0, String::new()));
 }
 

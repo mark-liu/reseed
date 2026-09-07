@@ -3,6 +3,7 @@
 //! texts (no internal citations).
 
 use super::Payload;
+use crate::msg;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -158,7 +159,7 @@ pub fn run(p: Payload) -> i32 {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
-                    "permissionDecisionReason": RECIPE,
+                    "permissionDecisionReason": msg::text("ledger-positional-read", RECIPE),
                 }
             })
         );
