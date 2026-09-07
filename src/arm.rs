@@ -96,20 +96,30 @@ pub fn run(opts: ArmOpts) -> Result<PathBuf> {
 
     if !opts.quiet {
         eprintln!(
-            "\nReload armed for session {sid} (and copied to clipboard as fallback):\n  {reload}\n\n\
-             Next (foreground TUI):  /clear   then type \"go\" (paste if the hook misses).\n\
-             NB: /clear is a slash command, do NOT prefix it with \"!\".\n\
-             Next (background/web session): same, /clear then \"go\". A background /clear mints a NEW \
-             session id, so the id key misses, but the reload matches this job's lineage and falls \
-             back to the cwd sidecar. Only if \"go\" injects nothing: start a fresh session and send \
-             the reload line above.\n\
-             (Bundle lags one turn - it captures up to your previous message.\n\
-             The armed reload expires after 10 minutes.)"
+            "\n{}",
+            crate::msg::fill(
+                &crate::msg::text("arm-armed", ARMED_DEFAULT),
+                &[("sid", sid.as_str()), ("reload", reload.as_str())],
+            )
         );
     }
 
     Ok(bundle_dir)
 }
+
+/// Public-safe default for the post-arm operator message. The site's own
+/// version names its hook scripts and tiers, so it lives in `arm-armed.txt`.
+const ARMED_DEFAULT: &str =
+    "Reload armed for session {sid} (and copied to clipboard as fallback):\n  \
+     {reload}\n\n\
+     Next (foreground TUI):  /clear   then type \"go\" (paste if the hook misses).\n\
+     NB: /clear is a slash command, do NOT prefix it with \"!\".\n\
+     Next (background/web session): same, /clear then \"go\". A background /clear mints a NEW \
+     session id, so the id key misses, but the reload matches this job's lineage and falls back to \
+     the cwd sidecar. Only if \"go\" injects nothing: start a fresh session and send the reload \
+     line above.\n\
+     (Bundle lags one turn, it captures up to your previous message.\n\
+     The armed reload expires after 10 minutes.)";
 
 /// Public-safe default. A harness with its own paging ceiling and turn-mapping
 /// recipe states them in `readverb-long.txt`, which this crate never carries.
