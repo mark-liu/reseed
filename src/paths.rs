@@ -88,3 +88,7 @@ fn computer_name() -> String {
             .unwrap_or_else(|| "localhost".to_string())
     })
 }
+
+pub fn roster() -> Result<PathBuf> {
+    Ok(home()?.join(".claude/daemon/roster.json"))
+}

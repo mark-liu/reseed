@@ -6,12 +6,15 @@
 //! Nothing here runs without `--inject`, and every pass re-reads the kill
 //! file, so stopping it is one `touch ~/.claude/reseed/watch.off`.
 
-use crate::{control, emit, paths, sentinel, usage, watch};
+use crate::{control, emit, parse, paths, pty, screen, sentinel, usage, watch};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Gap between the two box reads that bound the type-under-us window.
+const SETTLE: Duration = Duration::from_secs(3);
 
 /// A stage that never completes is retried once, then parked this long so a
 /// misjudged session is not typed into again and again (spec D6).
@@ -196,8 +199,30 @@ fn send_clear(
             "a distill for this session is still running",
         ));
     }
+    if attached_client(&cand.job) {
+        return Ok(Action::new(
+            &cand.sid,
+            &cand.job,
+            "skip",
+            "a client is attached, so someone may be typing",
+        ));
+    }
+    let box_state = prompt_box(&cand.job)?;
+    if !box_state.may_type() {
+        return Ok(Action::new(
+            &cand.sid,
+            &cand.job,
+            "skip",
+            box_state.reason(),
+        ));
+    }
     if opts.dry_run {
-        return Ok(Action::new(&cand.sid, &cand.job, "would-clear", "dry run"));
+        return Ok(Action::new(
+            &cand.sid,
+            &cand.job,
+            "would-clear",
+            format!("dry run, {}", box_state.reason()),
+        ));
     }
     let attempts = state
         .sessions
@@ -274,6 +299,21 @@ fn after_clear(
             ))
         }
         None => {
+            // The one detector for the guard having been wrong. A real /clear
+            // is a command entry; a concatenated one arrives as an ordinary
+            // prompt with the command buried inside it.
+            if let Some(why) = concatenation_seen(&cand.transcript) {
+                disarm_fleet(&why)?;
+                state.sessions.insert(
+                    cand.sid.clone(),
+                    Entry {
+                        stage: Stage::Failed,
+                        at: secs(now),
+                        ..entry.clone()
+                    },
+                );
+                return Ok(Action::new(&cand.sid, &cand.job, "tripwire", why));
+            }
             state.sessions.remove(&cand.sid);
             Ok(Action::new(
                 &cand.sid,
@@ -375,9 +415,103 @@ fn candidates(now: SystemTime) -> Result<Vec<Candidate>> {
     Ok(out)
 }
 
+/// Nobody can type into a background session without attaching to it, so an
+/// attached client is the only window in which the box can change under us.
+fn attached_client(job: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", &format!("claude attach {job}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
+}
+
+/// Read the box twice, a beat apart. One read proves what was there; two
+/// identical reads narrow the window in which a keystroke could land between
+/// the look and the paste.
+fn prompt_box(job: &str) -> Result<screen::BoxState> {
+    let Some(worker) = pty::workers()?.remove(job) else {
+        return Ok(screen::BoxState::NotRecognised(
+            "no pty socket for this job".into(),
+        ));
+    };
+    let first = screen::classify(&pty::read_screen(&worker)?);
+    if !first.may_type() {
+        return Ok(first);
+    }
+    std::thread::sleep(SETTLE);
+    let second = screen::classify(&pty::read_screen(&worker)?);
+    if second != first {
+        return Ok(screen::BoxState::NotRecognised(
+            "the box changed between two reads".into(),
+        ));
+    }
+    Ok(second)
+}
+
+/// Only the transcript tail matters: a concatenated submit is the newest user
+/// message, and these files reach tens of megabytes.
+const TAIL_BYTES: u64 = 64 * 1024;
+
+fn concatenation_seen(transcript: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(transcript).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .ok()?;
+    let mut tail = String::new();
+    file.read_to_string(&mut tail).ok()?;
+    for line in tail.lines().skip(1) {
+        let row: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if row.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let text = parse::content_to_string(&row["message"]["content"]);
+        // A genuine slash command is wrapped in a command-name element.
+        if text.contains("<command-name>") {
+            continue;
+        }
+        for typed in ["/clear", "/compact"] {
+            if let Some(at) = text.find(typed) {
+                if at > 0 {
+                    return Some(format!("a user message carries {typed} at offset {at}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The tripwire means a session was typed into blind. Stop every host, not
+/// just this one, and let Mark find out from the kill file.
+fn disarm_fleet(why: &str) -> Result<()> {
+    let kill = paths::kill_file()?;
+    if let Some(parent) = kill.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&kill, format!("tripwire: {why}\n"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Not a unit test: a hand-run probe that classifies a real session's box.
+    /// `RESEED_PROBE_JOB=<short> cargo test -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_a_live_prompt_box() {
+        let job = std::env::var("RESEED_PROBE_JOB").expect("set RESEED_PROBE_JOB");
+        for one in job.split(',') {
+            let verdict = prompt_box(one).expect("reading the box");
+            println!("{one}: {verdict:?} -> may_type={}", verdict.may_type());
+        }
+    }
 
     #[test]
     fn the_clear_band_starts_at_the_nudge_line_not_the_reset_line() {

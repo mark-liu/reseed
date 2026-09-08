@@ -25,7 +25,9 @@ mod msg;
 mod park;
 mod parse;
 mod paths;
+mod pty;
 mod reload;
+mod screen;
 mod sentinel;
 mod spawn;
 #[cfg(test)]
