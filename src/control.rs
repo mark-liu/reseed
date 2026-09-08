@@ -31,10 +31,10 @@ pub struct Job {
 }
 
 impl Job {
-    /// Typing into a busy worker queues the text mid-turn, so only an idle
-    /// one is a safe target.
-    pub fn is_idle(&self) -> bool {
-        self.tempo.as_deref() == Some("idle")
+    /// Only `active` is unsafe to type into; `blocked` means waiting on the
+    /// user, which is exactly the population that needs clearing.
+    pub fn is_busy(&self) -> bool {
+        self.tempo.as_deref() == Some("active")
     }
 }
 
@@ -218,19 +218,21 @@ mod tests {
     }
 
     #[test]
-    fn list_parses_jobs_and_idleness() {
+    fn list_parses_jobs_and_tempo() {
         let dir = tempdir().unwrap();
         let sock = dir.path().join("control.sock");
         let _rx = fake_daemon(
             &sock,
-            r#"{"ok":true,"op":"list","jobs":[{"short":"aaaa1111","sessionId":"s-1","tempo":"idle","state":"done","cwd":"/tmp","pid":1},{"short":"bbbb2222","tempo":"active"}]}"#,
+            r#"{"ok":true,"op":"list","jobs":[{"short":"aaaa1111","sessionId":"s-1","tempo":"idle","state":"done","cwd":"/tmp","pid":1},{"short":"bbbb2222","tempo":"active"},{"short":"cccc3333","tempo":"blocked"}]}"#,
         );
         let c = Control::new(sock, "k3y".into());
         let jobs = c.list().unwrap();
-        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.len(), 3);
         assert_eq!(jobs[0].session_id.as_deref(), Some("s-1"));
-        assert!(jobs[0].is_idle());
-        assert!(!jobs[1].is_idle());
+        assert!(!jobs[0].is_busy());
+        assert!(jobs[1].is_busy());
+        // blocked is waiting on the user, so it is a clear target, not a busy one
+        assert!(!jobs[2].is_busy());
     }
 
     #[test]
