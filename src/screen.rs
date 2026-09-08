@@ -30,8 +30,9 @@ const MIN_ROWS: u16 = 24;
 pub enum BoxState {
     /// The prompt box exists and holds nothing. The only state that may be typed into.
     Empty,
-    /// The human has typed something and not submitted it.
-    Draft { chars: usize },
+    /// The human has typed something and not submitted it. `fp` fingerprints
+    /// the text so two refusals can be told apart in the log without it.
+    Draft { chars: usize, fp: String },
     /// Anything else, including a layout this version does not know.
     NotRecognised(String),
 }
@@ -46,7 +47,9 @@ impl BoxState {
     pub fn reason(&self) -> String {
         match self {
             BoxState::Empty => "prompt box is empty".into(),
-            BoxState::Draft { chars } => format!("prompt box holds {chars} unsubmitted chars"),
+            BoxState::Draft { chars, fp } => {
+                format!("prompt box holds {chars} unsubmitted chars (fp {fp})")
+            }
             BoxState::NotRecognised(why) => format!("prompt box not recognised: {why}"),
         }
     }
@@ -82,6 +85,14 @@ fn addressed_rows(stream: &[u8]) -> u16 {
     max.min(MAX_ROWS)
 }
 
+/// Eight hex of sha256: enough to tell a stuck classifier reading the same
+/// pixels every tick from a human retyping, and not reversible to the draft.
+fn fingerprint(typed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(typed.as_bytes());
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn classify(stream: &[u8]) -> BoxState {
     if stream.is_empty() {
         return BoxState::NotRecognised("empty screen stream".into());
@@ -114,6 +125,7 @@ pub fn classify(stream: &[u8]) -> BoxState {
     if !typed.is_empty() {
         return BoxState::Draft {
             chars: typed.chars().count(),
+            fp: fingerprint(typed),
         };
     }
     // An empty row with the cursor away from the insertion point means the box
@@ -146,7 +158,7 @@ mod tests {
     #[test]
     fn a_draft_is_seen_and_counted_without_being_quoted() {
         let state = classify(&painted(50, "amend 3315 with the memberships entry"));
-        assert_eq!(state, BoxState::Draft { chars: 37 });
+        assert!(matches!(state, BoxState::Draft { chars: 37, .. }));
         assert!(!state.reason().contains("memberships"));
         assert!(!state.may_type());
     }
@@ -171,6 +183,9 @@ mod tests {
     #[test]
     fn a_tall_session_is_read_at_its_own_height() {
         assert_eq!(classify(&painted(64, "")), BoxState::Empty);
-        assert_eq!(classify(&painted(64, "hi")), BoxState::Draft { chars: 2 });
+        assert!(matches!(
+            classify(&painted(64, "hi")),
+            BoxState::Draft { chars: 2, .. }
+        ));
     }
 }

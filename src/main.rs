@@ -134,6 +134,10 @@ enum Command {
         /// With --inject: report what it would type, type nothing.
         #[arg(long)]
         dry_run: bool,
+        /// With --inject: consider only this job (short id). Everything else
+        /// is left alone, so a proof run cannot reach a live session.
+        #[arg(long, value_name = "JOB")]
+        only: Option<String>,
     },
 }
 
@@ -199,12 +203,13 @@ fn main() -> Result<()> {
             log,
             inject,
             dry_run,
+            only,
         } => watch::run(watch::WatchOpts {
             once,
             since_days: since,
             json,
             log_path: log,
-            inject: inject.then_some(inject::InjectOpts { dry_run }),
+            inject: inject.then_some(inject::InjectOpts { dry_run, only }),
         }),
     }
 }
