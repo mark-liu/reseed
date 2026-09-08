@@ -175,6 +175,17 @@ mod tests {
     fn cases() -> Vec<(bool, &'static str)> {
         vec![
             (true, "tail -8 ~/scratch/parked/host-a.md | cut -c1-400"),
+            // The append's own self-check: a heredoc park followed by a
+            // one-line tail of the SAME ledger. Masking the opener line whole
+            // used to hide the `>>` and deny it.
+            (
+                false,
+                "cat >> ~/scratch/parked/host-a.md <<'PARK'\nhello\nPARK\ntail -1 ~/scratch/parked/host-a.md",
+            ),
+            (
+                false,
+                "cat >> ~/scratch/parked/host-a.md <<'PARK'\na | b | resume: x\nPARK\necho ok; tail -1 ~/scratch/parked/host-a.md | cut -c1-80",
+            ),
             (true, "sed -n '90,95p' ~/scratch/parked/host-a.md"),
             (true, "cat $HOME/scratch/parked/host-a.md"),
             (true, "head -20 ~/scratch/parked/host-b.md"),

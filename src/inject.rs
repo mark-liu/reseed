@@ -341,6 +341,13 @@ fn distill_running(sid: &str) -> bool {
         .any(|l| (l.contains("distill") || l.contains("reseed-here")) && l.contains(&short))
 }
 
+/// The nudge band, not just the reset line: the statusline asks for a clear at
+/// `early`, so waiting for tier 1 leaves an armed session idle through the whole
+/// 240-300k window. An unknown ctx stays out, never guessed into scope.
+fn in_clear_band(tier: u8, ctx: Option<u64>, early: u64) -> bool {
+    tier > 0 || ctx.is_some_and(|c| c >= early)
+}
+
 /// Background sessions past the line that have a bundle armed for them.
 fn candidates(now: SystemTime) -> Result<Vec<Candidate>> {
     let pending = paths::pending()?;
@@ -350,8 +357,8 @@ fn candidates(now: SystemTime) -> Result<Vec<Candidate>> {
         let Some(transcript) = watch::transcript_for(&projects, &sid) else {
             continue;
         };
-        let (tier, _ctx, _line, _early) = usage::context_state(&transcript);
-        if tier == 0 {
+        let (tier, ctx, _line, early) = usage::context_state(&transcript);
+        if !in_clear_band(tier, ctx, early) {
             continue;
         }
         let Some(arm) = sentinel::read(&pending, &sentinel::key(&sid)) else {
@@ -371,6 +378,16 @@ fn candidates(now: SystemTime) -> Result<Vec<Candidate>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_clear_band_starts_at_the_nudge_line_not_the_reset_line() {
+        // 260k armed on partly sat idle because tier was still 0 (2026-09-08).
+        assert!(in_clear_band(0, Some(260_000), 240_000));
+        assert!(in_clear_band(0, Some(240_000), 240_000));
+        assert!(in_clear_band(1, Some(300_000), 240_000));
+        assert!(!in_clear_band(0, Some(239_999), 240_000));
+        assert!(!in_clear_band(0, None, 240_000));
+    }
 
     #[test]
     fn only_identity_tiers_prove_a_reload() {

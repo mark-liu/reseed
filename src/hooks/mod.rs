@@ -76,7 +76,13 @@ pub fn mask_heredocs(command: &str) -> String {
     while i < lines.len() {
         if let Some(cap) = start_re.captures(lines[i]) {
             let word = cap.get(1).unwrap().as_str().to_string();
-            out.push(" ".repeat(lines[i].len()));
+            // Keep the opener's prefix: `cat >> <ledger> <<'PARK'` carries the
+            // real redirect, and masking it hid the append from the ledger
+            // guard's own-line self-check.
+            let at = cap.get(0).unwrap().start();
+            let mut masked = lines[i][..at].to_string();
+            masked.push_str(&" ".repeat(lines[i].len() - at));
+            out.push(masked);
             i += 1;
             while i < lines.len() {
                 let terminator = lines[i].trim();
