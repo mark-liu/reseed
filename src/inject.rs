@@ -6,7 +6,7 @@
 //! Nothing here runs without `--inject`, and every pass re-reads the kill
 //! file, so stopping it is one `touch ~/.claude/reseed/watch.off`.
 
-use crate::{control, emit, parse, paths, pty, screen, sentinel, usage, watch};
+use crate::{arm, control, emit, parse, paths, pty, screen, sentinel, usage, watch};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -180,17 +180,6 @@ fn send_clear(
     if !job.is_idle() {
         return Ok(Action::new(&cand.sid, &cand.job, "skip", "worker is busy"));
     }
-    if !sentinel::is_fresh(&cand.arm, now) {
-        return Ok(Action::new(
-            &cand.sid,
-            &cand.job,
-            "skip",
-            "sentinel is stale",
-        ));
-    }
-    if let Some(why) = bundle_trails_transcript(&cand.sid, &cand.transcript) {
-        return Ok(Action::new(&cand.sid, &cand.job, "skip", why));
-    }
     if distill_running(&cand.sid) {
         return Ok(Action::new(
             &cand.sid,
@@ -215,6 +204,37 @@ fn send_clear(
             "skip",
             box_state.reason(),
         ));
+    }
+    // Staleness is repairable, so it is checked last: an armed bundle goes
+    // stale in ten minutes and only a hook re-armed it, which left the
+    // injector skipping the same session forever (D4). Re-arm here instead
+    // and clear on the next pass, against freshly read state.
+    let stale = (!sentinel::is_fresh(&cand.arm, now))
+        .then(|| "sentinel is stale".to_string())
+        .or_else(|| bundle_trails_transcript(&cand.sid, &cand.transcript));
+    if let Some(why) = stale {
+        if opts.dry_run {
+            return Ok(Action::new(
+                &cand.sid,
+                &cand.job,
+                "would-rearm",
+                format!("dry run, {why}"),
+            ));
+        }
+        return Ok(match rearm(&cand.sid, cand.arm.pid) {
+            Ok(()) => Action::new(
+                &cand.sid,
+                &cand.job,
+                "rearm",
+                format!("{why}, re-armed; clearing next pass"),
+            ),
+            Err(e) => Action::new(
+                &cand.sid,
+                &cand.job,
+                "skip",
+                format!("{why}, re-arm failed: {e}"),
+            ),
+        });
     }
     if opts.dry_run {
         return Ok(Action::new(
@@ -413,6 +433,18 @@ fn candidates(now: SystemTime) -> Result<Vec<Candidate>> {
         });
     }
     Ok(out)
+}
+
+/// Distil the session again so its bundle is current, then let the next pass
+/// clear it. Synchronous: `arm::run` writes the sentinel last, so on return
+/// the bundle is whole rather than half-written.
+fn rearm(sid: &str, pid: Option<u32>) -> Result<()> {
+    arm::run(arm::ArmOpts {
+        sid: Some(sid.to_string()),
+        quiet: true,
+        pid,
+    })
+    .map(|_| ())
 }
 
 /// Nobody can type into a background session without attaching to it, so an
