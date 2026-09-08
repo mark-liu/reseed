@@ -264,7 +264,7 @@ fn send_clear(
             "no live daemon worker for this job",
         ));
     };
-    if !job.is_idle() {
+    if job.is_busy() {
         return Ok(Action::new(&cand.sid, &cand.job, "skip", "worker is busy"));
     }
     if distill_running(&cand.sid) {
