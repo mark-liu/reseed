@@ -6,7 +6,7 @@
 //! Nothing here runs without `--inject`, and every pass re-reads the kill
 //! file, so stopping it is one `touch ~/.claude/reseed/watch.off`.
 
-use crate::{arm, control, emit, parse, paths, pty, screen, sentinel, usage, watch};
+use crate::{arm, control, emit, paths, pty, screen, sentinel, usage, watch};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -419,7 +419,7 @@ fn after_clear(
             // The one detector for the guard having been wrong. A real /clear
             // is a command entry; a concatenated one arrives as an ordinary
             // prompt with the command buried inside it.
-            if let Some(why) = concatenation_seen(transcript) {
+            if let Some(why) = concatenation_seen(transcript, since) {
                 disarm_fleet(&why)?;
                 state.sessions.insert(
                     sid.to_string(),
@@ -590,7 +590,7 @@ fn prompt_box(job: &str) -> Result<screen::BoxState> {
 /// message, and these files reach tens of megabytes.
 const TAIL_BYTES: u64 = 64 * 1024;
 
-fn concatenation_seen(transcript: &Path) -> Option<String> {
+fn concatenation_seen(transcript: &Path, since: SystemTime) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(transcript).ok()?;
     let len = file.metadata().ok()?.len();
@@ -598,6 +598,7 @@ fn concatenation_seen(transcript: &Path) -> Option<String> {
         .ok()?;
     let mut tail = String::new();
     file.read_to_string(&mut tail).ok()?;
+    let since_secs = secs(since);
     for line in tail.lines().skip(1) {
         let row: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -606,24 +607,61 @@ fn concatenation_seen(transcript: &Path) -> Option<String> {
         if row.get("type").and_then(|t| t.as_str()) != Some("user") {
             continue;
         }
-        let text = parse::content_to_string(&row["message"]["content"]);
+        // Tool output is the harness quoting itself, and reseed's own nudge
+        // text rides in on it. Only a keystroke can concatenate.
+        if row.get("toolUseResult").is_some() {
+            continue;
+        }
+        // Only this clear's own window. An untimestamped row is foreign, not
+        // a submit: every real user row carries one.
+        let fresh = row
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(emit::parse_ts_secs)
+            .is_some_and(|ts| ts >= since_secs);
+        if !fresh {
+            continue;
+        }
+        let text = match typed_text(&row["message"]["content"]) {
+            Some(text) => text,
+            None => continue,
+        };
         // A genuine slash command is wrapped in a command-name element.
         if text.contains("<command-name>") {
             continue;
         }
+        let text = text.trim_end();
         for typed in ["/clear", "/compact"] {
-            if let Some(at) = text.find(typed) {
-                if at > 0 {
-                    return Some(format!("a user message carries {typed} at offset {at}"));
-                }
+            if text.ends_with(typed) && text.len() > typed.len() {
+                return Some(format!("a typed prompt ends with {typed}"));
             }
         }
     }
     None
 }
 
-/// The tripwire means a session was typed into blind. Stop every host, not
-/// just this one, and let Mark find out from the kill file.
+/// The prompt as a human typed it, or `None` for anything the harness built.
+/// A paste splices at the cursor and the return submits, so the concatenated
+/// shape is always a plain text row ending in the command.
+fn typed_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for block in items {
+                if block.get("type").and_then(|t| t.as_str()) != Some("text") {
+                    return None;
+                }
+                out.push(block.get("text").and_then(|t| t.as_str())?.to_string());
+            }
+            Some(out.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+/// The tripwire means a session was typed into blind. Stop this host and let
+/// Mark find out from the kill file; there is no fleet propagation.
 fn disarm_fleet(why: &str) -> Result<()> {
     let kill = paths::kill_file()?;
     if let Some(parent) = kill.parent() {
@@ -761,5 +799,62 @@ mod tests {
             ..fresh
         };
         assert!(cooled_down(&old, now));
+    }
+
+    /// Fixtures are the real row shapes: a typed prompt is a plain string or
+    /// text blocks, and hook output arrives as a `tool_result` with a
+    /// `toolUseResult` sibling.
+    fn transcript_with(rows: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let mut body = String::from("{\"type\":\"summary\"}\n");
+        for row in rows {
+            body.push_str(row);
+            body.push('\n');
+        }
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    fn at(ts: &str) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(emit::parse_ts_secs(ts).unwrap())
+    }
+
+    #[test]
+    fn the_reseed_nudge_in_tool_output_is_not_a_concatenation() {
+        // The bug that kill-switched partly: the injector's own Stop-hook text
+        // rides in on a tool result and used to trip the tripwire.
+        let row = r#"{"type":"user","timestamp":"2026-09-08T05:27:06Z","toolUseResult":{"stdout":"ok"},"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"bundle armed: /clear then 'go' at the next natural break"}]}}"#;
+        let (_d, path) = transcript_with(&[row]);
+        assert_eq!(concatenation_seen(&path, at("2026-09-08T05:20:00Z")), None);
+    }
+
+    #[test]
+    fn a_typed_prompt_ending_in_clear_is_a_concatenation() {
+        let row = r#"{"type":"user","timestamp":"2026-09-08T05:27:06Z","message":{"content":"build drill 11 from the spec/clear"}}"#;
+        let (_d, path) = transcript_with(&[row]);
+        let why = concatenation_seen(&path, at("2026-09-08T05:20:00Z")).unwrap();
+        assert!(why.contains("/clear"), "{why}");
+    }
+
+    #[test]
+    fn a_real_slash_command_is_not_a_concatenation() {
+        let row = r#"{"type":"user","timestamp":"2026-09-08T05:27:06Z","message":{"content":"<command-name>/clear</command-name>\n\ngo"}}"#;
+        let (_d, path) = transcript_with(&[row]);
+        assert_eq!(concatenation_seen(&path, at("2026-09-08T05:20:00Z")), None);
+    }
+
+    #[test]
+    fn a_prompt_merely_discussing_clear_is_not_a_concatenation() {
+        let row = r#"{"type":"user","timestamp":"2026-09-08T05:27:06Z","message":{"content":[{"type":"text","text":"why did /clear not fire on this session"}]}}"#;
+        let (_d, path) = transcript_with(&[row]);
+        assert_eq!(concatenation_seen(&path, at("2026-09-08T05:20:00Z")), None);
+    }
+
+    #[test]
+    fn a_concatenation_from_before_this_clear_is_out_of_window() {
+        let row = r#"{"type":"user","timestamp":"2026-09-08T05:10:00Z","message":{"content":"old draft/clear"}}"#;
+        let (_d, path) = transcript_with(&[row]);
+        assert_eq!(concatenation_seen(&path, at("2026-09-08T05:20:00Z")), None);
     }
 }
