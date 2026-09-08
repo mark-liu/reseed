@@ -9,7 +9,7 @@
 use crate::{arm, control, emit, parse, paths, pty, screen, sentinel, usage, watch};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -106,6 +106,8 @@ pub struct Candidate {
 
 pub struct InjectOpts {
     pub dry_run: bool,
+    /// Scope a proof run to one job; `None` is the production sweep.
+    pub only: Option<String>,
 }
 
 pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
@@ -122,15 +124,32 @@ pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
     let mut state = State::load(&state_path);
     let control = control::Control::discover()?;
     let jobs = control.list()?;
+    let projects = paths::projects()?;
     let now = SystemTime::now();
 
     let mut actions = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for cand in candidates(now)? {
+        if opts.only.as_ref().is_some_and(|j| *j != cand.job) {
+            continue;
+        }
+        seen.insert(cand.sid.clone());
         let entry = state.sessions.get(&cand.sid).cloned();
         let action = match entry.map(|e| (e.stage, e)) {
             Some((Stage::Done, _)) => continue,
             Some((Stage::Failed, e)) if !cooled_down(&e, now) => continue,
-            Some((Stage::ClearSent, e)) => after_clear(&control, &cand, &e, now, opts, &mut state)?,
+            Some((Stage::ClearSent, e)) => after_clear(
+                &control,
+                &InFlight {
+                    sid: &cand.sid,
+                    job: &cand.job,
+                    transcript: &cand.transcript,
+                },
+                &e,
+                now,
+                opts,
+                &mut state,
+            )?,
             Some((Stage::GoSent, e)) => {
                 state.sessions.insert(
                     cand.sid.clone(),
@@ -145,8 +164,76 @@ pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
         };
         actions.push(action);
     }
+    actions.extend(drive_in_flight(
+        &control, &jobs, &projects, &seen, now, opts, &mut state,
+    )?);
     if !opts.dry_run {
         state.save(&state_path)?;
+    }
+    Ok(actions)
+}
+
+/// Arms mid-flight that no candidate covered this pass.
+fn in_flight_entries(state: &State, seen: &BTreeSet<String>) -> Vec<(String, Entry)> {
+    state
+        .sessions
+        .iter()
+        .filter(|(sid, e)| {
+            !seen.contains(*sid) && matches!(e.stage, Stage::ClearSent | Stage::GoSent)
+        })
+        .map(|(sid, e)| (sid.clone(), e.clone()))
+        .collect()
+}
+
+/// A `/clear` mints a NEW session id, so the arm sid stops being a live
+/// session the instant the clear lands and never comes back as a candidate.
+/// Without this the state machine sticks at `clear_sent` and `go` is never
+/// typed: drive an in-flight arm by its JOB, which does survive the clear.
+fn drive_in_flight(
+    control: &control::Control,
+    jobs: &[control::Job],
+    projects: &Path,
+    seen: &BTreeSet<String>,
+    now: SystemTime,
+    opts: &InjectOpts,
+    state: &mut State,
+) -> Result<Vec<Action>> {
+    let pending = in_flight_entries(state, seen);
+    let mut actions = Vec::new();
+    for (sid, entry) in pending {
+        if opts.only.as_ref().is_some_and(|j| *j != entry.job) {
+            continue;
+        }
+        if !jobs.iter().any(|j| j.short == entry.job) {
+            continue;
+        }
+        let Some(transcript) = watch::transcript_for(projects, &sid) else {
+            continue;
+        };
+        actions.push(match entry.stage {
+            Stage::ClearSent => after_clear(
+                control,
+                &InFlight {
+                    sid: &sid,
+                    job: &entry.job,
+                    transcript: &transcript,
+                },
+                &entry,
+                now,
+                opts,
+                state,
+            )?,
+            _ => {
+                state.sessions.insert(
+                    sid.clone(),
+                    Entry {
+                        stage: Stage::Done,
+                        ..entry.clone()
+                    },
+                );
+                Action::new(&sid, &entry.job, "done", "clear and go both delivered")
+            }
+        });
     }
     Ok(actions)
 }
@@ -263,26 +350,36 @@ fn send_clear(
     Ok(Action::new(&cand.sid, &cand.job, "clear", "typed /clear"))
 }
 
+/// What `after_clear` needs about a session. Held separately from `Candidate`
+/// because a clear mints a new session id, so the arm sid it carries is no
+/// longer a live session by the time the follow-up runs.
+struct InFlight<'a> {
+    sid: &'a str,
+    job: &'a str,
+    transcript: &'a Path,
+}
+
 /// `go` is only earned once the reload is proven to have reached a context:
 /// an identity-tier emit row for this arm, and a `hook_success` attachment
 /// in the session that received it (spec D9).
 fn after_clear(
     control: &control::Control,
-    cand: &Candidate,
+    t: &InFlight,
     entry: &Entry,
     now: SystemTime,
     opts: &InjectOpts,
     state: &mut State,
 ) -> Result<Action> {
+    let (sid, job, transcript) = (t.sid, t.job, t.transcript);
     let since = UNIX_EPOCH + Duration::from_secs(entry.at);
-    match delivered_since(&cand.sid, since)? {
+    match delivered_since(sid, since)? {
         Some(new_sid) => {
             if opts.dry_run {
-                return Ok(Action::new(&cand.sid, &cand.job, "would-go", "dry run"));
+                return Ok(Action::new(sid, job, "would-go", "dry run"));
             }
-            control.reply(&cand.job, "go")?;
+            control.reply(job, "go")?;
             state.sessions.insert(
-                cand.sid.clone(),
+                sid.to_string(),
                 Entry {
                     stage: Stage::GoSent,
                     at: secs(now),
@@ -290,21 +387,21 @@ fn after_clear(
                 },
             );
             Ok(Action::new(
-                &cand.sid,
-                &cand.job,
+                sid,
+                job,
                 "go",
                 format!("reload delivered into {}", &new_sid[..8.min(new_sid.len())]),
             ))
         }
         None if secs(now).saturating_sub(entry.at) < CLEAR_GRACE.as_secs() => Ok(Action::new(
-            &cand.sid,
-            &cand.job,
+            sid,
+            job,
             "wait",
             "clear sent, reload not proven yet",
         )),
         None if entry.attempts >= MAX_ATTEMPTS => {
             state.sessions.insert(
-                cand.sid.clone(),
+                sid.to_string(),
                 Entry {
                     stage: Stage::Failed,
                     at: secs(now),
@@ -312,8 +409,8 @@ fn after_clear(
                 },
             );
             Ok(Action::new(
-                &cand.sid,
-                &cand.job,
+                sid,
+                job,
                 "fail",
                 "no reload after the retry; left for Mark",
             ))
@@ -322,22 +419,22 @@ fn after_clear(
             // The one detector for the guard having been wrong. A real /clear
             // is a command entry; a concatenated one arrives as an ordinary
             // prompt with the command buried inside it.
-            if let Some(why) = concatenation_seen(&cand.transcript) {
+            if let Some(why) = concatenation_seen(transcript) {
                 disarm_fleet(&why)?;
                 state.sessions.insert(
-                    cand.sid.clone(),
+                    sid.to_string(),
                     Entry {
                         stage: Stage::Failed,
                         at: secs(now),
                         ..entry.clone()
                     },
                 );
-                return Ok(Action::new(&cand.sid, &cand.job, "tripwire", why));
+                return Ok(Action::new(sid, job, "tripwire", why));
             }
-            state.sessions.remove(&cand.sid);
+            state.sessions.remove(sid);
             Ok(Action::new(
-                &cand.sid,
-                &cand.job,
+                sid,
+                job,
                 "retry",
                 "no reload after the clear; will re-arm the attempt",
             ))
@@ -347,13 +444,20 @@ fn after_clear(
 
 /// The session id that received this arm's reload, if the emit log and the
 /// receiving transcript both say so.
+/// `emit.log` truncates `sid` to eight chars but writes `arm` whole, so an
+/// eight-char equality test never matched a real row and no clear ever
+/// earned its `go`. Prefix, to accept both shapes.
+fn arm_matches(row_arm: &str, arm8: &str) -> bool {
+    row_arm.starts_with(arm8)
+}
+
 fn delivered_since(arm_sid: &str, since: SystemTime) -> Result<Option<String>> {
     let log = paths::emit_log()?;
     let projects = paths::projects()?;
     let since_secs = secs(since);
     let arm8: String = arm_sid.chars().take(8).collect();
     for row in emit::read_rows(&log)?.into_iter().rev() {
-        if row.arm != arm8 || !is_identity_tier(&row.tier) {
+        if !arm_matches(&row.arm, &arm8) || !is_identity_tier(&row.tier) {
             continue;
         }
         if emit::parse_ts_secs(&row.ts).unwrap_or(0) < since_secs {
@@ -532,6 +636,53 @@ fn disarm_fleet(why: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(stage: Stage, job: &str) -> Entry {
+        Entry {
+            stage,
+            at: 0,
+            attempts: 1,
+            job: job.into(),
+            arm_sid: "a0e9d562-111e".into(),
+        }
+    }
+
+    #[test]
+    fn arm_row_is_matched_whole_or_truncated() {
+        assert!(arm_matches(
+            "a0e9d562-111e-4a48-a876-9fd9fec11ff0",
+            "a0e9d562"
+        ));
+        assert!(arm_matches("a0e9d562", "a0e9d562"));
+        assert!(!arm_matches(
+            "b8816add-0000-0000-0000-000000000000",
+            "a0e9d562"
+        ));
+    }
+
+    #[test]
+    fn a_cleared_arm_is_still_driven_once_it_stops_being_a_candidate() {
+        let mut state = State::default();
+        state
+            .sessions
+            .insert("a0e9d562-111e".into(), entry(Stage::ClearSent, "a0e9d562"));
+        state
+            .sessions
+            .insert("done-one".into(), entry(Stage::Done, "zzz"));
+        let picked = in_flight_entries(&state, &BTreeSet::new());
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].0, "a0e9d562-111e");
+    }
+
+    #[test]
+    fn an_arm_the_candidate_pass_already_handled_is_not_driven_twice() {
+        let mut state = State::default();
+        state
+            .sessions
+            .insert("a0e9d562-111e".into(), entry(Stage::ClearSent, "a0e9d562"));
+        let seen: BTreeSet<String> = ["a0e9d562-111e".to_string()].into_iter().collect();
+        assert!(in_flight_entries(&state, &seen).is_empty());
+    }
 
     /// Not a unit test: a hand-run probe that classifies a real session's box.
     /// `RESEED_PROBE_JOB=<short> cargo test -- --ignored --nocapture`
