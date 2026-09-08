@@ -21,6 +21,9 @@ anyhow = "1"
 sha2 = "0.10"
 regex = "1"
 libc = "0.2"
+# A real terminal emulator: the box can only be told from scrollback by
+# replaying the cursor addressing, which an ANSI strip cannot do.
+vt100 = "0.16"
 
 [dev-dependencies]
 tempfile = "3"
