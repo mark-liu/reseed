@@ -120,7 +120,7 @@ pub fn run(opts: WatchOpts) -> Result<()> {
 }
 
 fn print_text(report: &Report) {
-    println!("Live sessions past the context line:");
+    println!("Live sessions in the nudge band or past the line:");
     if report.sessions.is_empty() {
         println!("  (none)");
     }
@@ -291,12 +291,14 @@ fn live_sessions_past_line() -> Result<Vec<SessionReport>> {
             "terminal"
         };
         let transcript = find_transcript(&projects_dir, &sid);
-        let (tier, ctx, _line, _early) = match &transcript {
+        let (tier, ctx, _line, early) = match &transcript {
             Some(p) => usage::context_state(p),
             None => (0, None, 0, 0),
         };
-        if tier == 0 {
-            continue; // not past the line: out of scope for this report
+        // The early band is in scope: it is where the injector now acts, so a
+        // report that stopped at tier 1 would hide the sessions it clears.
+        if tier == 0 && !ctx.is_some_and(|c| c >= early) {
+            continue;
         }
         let armed = sentinel::read(&pending, &sentinel::key(&sid)).is_some();
         out.push(SessionReport {
