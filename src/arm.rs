@@ -10,6 +10,10 @@ pub struct ArmOpts {
     pub sid: Option<String>,
     pub quiet: bool,
     pub pid: Option<u32>,
+    /// The target session's own work dir. The detached rearm path runs under
+    /// launchd, whose cwd is `/`, and the hook's tier 3 asks whether the ARM's
+    /// cwd is at or under the SESSION's - `/` is neither, so it never matches.
+    pub cwd: Option<String>,
 }
 
 /// Arm the sentinel for `opts.sid` (or `$CLAUDE_CODE_SESSION_ID`). Returns
@@ -58,15 +62,21 @@ pub fn run(opts: ArmOpts) -> Result<PathBuf> {
             });
     }
 
-    let cwd = std::env::var("PWD")
-        .ok()
+    let cwd = opts
+        .cwd
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| std::env::var("PWD").ok())
         .or_else(|| {
             std::env::current_dir()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
         })
+        .filter(|c| usable_cwd(c))
         .unwrap_or_default();
-    atomic::write(&pending.join(format!("{key}.cwd")), cwd.as_bytes())?;
+    if !cwd.is_empty() {
+        atomic::write(&pending.join(format!("{key}.cwd")), cwd.as_bytes())?;
+    }
     if let Ok(job_dir) = std::env::var("CLAUDE_JOB_DIR") {
         if !job_dir.is_empty() {
             let job = PathBuf::from(&job_dir)
@@ -105,6 +115,13 @@ pub fn run(opts: ArmOpts) -> Result<PathBuf> {
     }
 
     Ok(bundle_dir)
+}
+
+/// A cwd worth recording: absolute, and not the root. `/` and no sidecar are
+/// equivalent at the hook (both miss tier 3, both GC as "another root"), so
+/// this buys clarity, not safety - the real fix is passing the session's cwd.
+fn usable_cwd(c: &str) -> bool {
+    c.starts_with('/') && !c.trim_end_matches('/').is_empty()
 }
 
 /// Public-safe default for the post-arm operator message. The site's own

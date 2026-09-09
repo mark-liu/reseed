@@ -169,3 +169,61 @@ fn lock_contention_exits_0_with_already_distilling() {
     // No new sentinel: the held lock stopped the distill from running.
     assert!(!pending.join("sid3").exists());
 }
+
+/// The detached rearm path runs under launchd, whose cwd is `/`. Left to the
+/// `$PWD` fallback it wrote `/` into the sidecar, and tier 3 asks whether the
+/// arm's cwd is at or under the session's, which `/` never is.
+#[test]
+fn an_explicit_cwd_beats_the_process_pwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    plant_transcript(tmp.path(), "sid-cwd");
+    let out = bin()
+        .args([
+            "arm",
+            "--sid",
+            "sid-cwd",
+            "--quiet",
+            "--cwd",
+            "/srv/project/work",
+        ])
+        .env("HOME", tmp.path())
+        .env("PWD", "/")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(".claude/reseed/pending/sid-cwd.cwd")).unwrap(),
+        "/srv/project/work"
+    );
+}
+
+/// `/` and no sidecar behave identically at the hook, so root is written as
+/// nothing rather than as a value that reads like a real answer.
+#[test]
+fn a_root_cwd_writes_no_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    plant_transcript(tmp.path(), "sid-root");
+    let out = bin()
+        .args(["arm", "--sid", "sid-root", "--quiet", "--cwd", "/"])
+        .env("HOME", tmp.path())
+        .env("PWD", "/")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pending = tmp.path().join(".claude/reseed/pending");
+    assert!(
+        pending.join("sid-root").exists(),
+        "the arm itself still lands"
+    );
+    assert!(!pending.join("sid-root.cwd").exists());
+}

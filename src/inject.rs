@@ -19,16 +19,27 @@ const SETTLE: Duration = Duration::from_secs(3);
 /// A stage that never completes is retried once, then parked this long so a
 /// misjudged session is not typed into again and again (spec D6).
 const COOLDOWN: Duration = Duration::from_secs(15 * 60);
-/// The reload hook has a 30 s timeout, so a clear can take that long to
-/// prove itself before the retry is the right move.
-const CLEAR_GRACE: Duration = Duration::from_secs(45);
+/// How long a clear gets to prove its reload before recovery is the right
+/// move. Mark's call 2026-09-09: 10 s, not 45. The 45 was sized off the reload
+/// hook's 30 s timeout, but the sweep only runs every 30 s anyway, so the
+/// grace only ever decided whether the verdict came on the FIRST tick after
+/// the clear or the second. What made waiting safe to shorten is the
+/// session-id guard in `recover`: a clear that has not actually landed is now
+/// refused on the daemon's own view rather than on elapsed time.
+const CLEAR_GRACE: Duration = Duration::from_secs(10);
 const MAX_ATTEMPTS: u32 = 2;
 
 /// Tiers that mean the hook matched this session by identity and loaded its
 /// bundle. `3-*` is the cwd heuristic, which also logs `arm=` and can inject
 /// nothing, so it is not proof (spec D9).
 fn is_identity_tier(tier: &str) -> bool {
-    matches!(tier, "1" | "1b" | "2" | "2-jobmatch") || tier.starts_with("2-jobmatch")
+    // The `-stale` variants are the SAME identity match behind an opt-out
+    // wrapper, and the wrapper still puts the reload in the new context. They
+    // are 51 of ~240 rows on this host, and rejecting them made a delivered
+    // reload read as undelivered - harmless when that only skipped `go`, a
+    // double paste now that it reaches `recover`.
+    let tier = tier.strip_suffix("-stale").unwrap_or(tier);
+    matches!(tier, "1" | "1b" | "2") || tier.starts_with("2-jobmatch")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +47,8 @@ fn is_identity_tier(tier: &str) -> bool {
 pub enum Stage {
     ClearSent,
     GoSent,
+    /// The hook dropped the arm and the injector delivered the reload itself.
+    Recovered,
     Done,
     Failed,
 }
@@ -127,6 +140,7 @@ pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
     let projects = paths::projects()?;
     let now = SystemTime::now();
 
+    let pending_dir = paths::pending()?;
     let mut actions = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for cand in candidates(now)? {
@@ -140,10 +154,12 @@ pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
             Some((Stage::Failed, e)) if !cooled_down(&e, now) => continue,
             Some((Stage::ClearSent, e)) => after_clear(
                 &control,
+                &jobs,
                 &InFlight {
                     sid: &cand.sid,
                     job: &cand.job,
-                    transcript: &cand.transcript,
+                    transcript: Some(&cand.transcript),
+                    pending: &pending_dir,
                 },
                 &e,
                 now,
@@ -167,8 +183,78 @@ pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
     actions.extend(drive_in_flight(
         &control, &jobs, &projects, &seen, now, opts, &mut state,
     )?);
+    actions.extend(drive_stranded(
+        &control,
+        &jobs,
+        &pending_dir,
+        &seen,
+        now,
+        opts,
+        &mut state,
+    )?);
     if !opts.dry_run {
         state.save(&state_path)?;
+    }
+    Ok(actions)
+}
+
+/// An arm whose session was cleared but whose reload never landed, left
+/// behind by a build that dropped the state entry on `retry`. The state map
+/// is the only handle `drive_in_flight` has, so those are invisible to it and
+/// stayed stranded for good; the arm itself is the durable evidence.
+///
+/// The discriminator is the daemon's own view: the job is still alive, the
+/// arm names a session that job no longer runs, and the arm was never
+/// consumed. A hook that had delivered would have deleted it.
+fn drive_stranded(
+    control: &control::Control,
+    jobs: &[control::Job],
+    pending: &Path,
+    seen: &BTreeSet<String>,
+    now: SystemTime,
+    opts: &InjectOpts,
+    state: &mut State,
+) -> Result<Vec<Action>> {
+    let mut actions = Vec::new();
+    for arm in sentinel::list(pending) {
+        let Some(sid) = arm.path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(armjob) = arm.job.as_deref().map(str::trim).filter(|j| !j.is_empty()) else {
+            continue; // a foreground TUI arm: no job to type into
+        };
+        if opts.only.as_ref().is_some_and(|j| j != armjob) {
+            continue;
+        }
+        // Anything the state map knows about is already driven above, and
+        // that is what keeps the 45s window between `/clear` and the hook's
+        // consume from being read as a strand.
+        if seen.contains(sid) || state.sessions.contains_key(sid) {
+            continue;
+        }
+        let Some(job) = jobs.iter().find(|j| j.short == armjob) else {
+            continue; // the job is gone, so there is nothing to deliver into
+        };
+        // The clear is what replaced the session id. Same id still running
+        // means no clear happened and the context is intact - never type a
+        // reload into a session that never lost one.
+        if job.session_id.as_deref().unwrap_or(sid) == sid {
+            continue;
+        }
+        let entry = Entry {
+            stage: Stage::ClearSent,
+            at: secs(arm.mtime),
+            attempts: 1,
+            job: armjob.to_string(),
+            arm_sid: sid.to_string(),
+        };
+        let t = InFlight {
+            sid,
+            job: armjob,
+            transcript: None,
+            pending,
+        };
+        actions.push(recover(control, jobs, &t, &entry, now, opts, state)?);
     }
     Ok(actions)
 }
@@ -198,6 +284,7 @@ fn drive_in_flight(
     opts: &InjectOpts,
     state: &mut State,
 ) -> Result<Vec<Action>> {
+    let pending_dir = paths::pending()?;
     let pending = in_flight_entries(state, seen);
     let mut actions = Vec::new();
     for (sid, entry) in pending {
@@ -213,10 +300,12 @@ fn drive_in_flight(
         actions.push(match entry.stage {
             Stage::ClearSent => after_clear(
                 control,
+                jobs,
                 &InFlight {
                     sid: &sid,
                     job: &entry.job,
-                    transcript: &transcript,
+                    transcript: Some(&transcript),
+                    pending: &pending_dir,
                 },
                 &entry,
                 now,
@@ -224,6 +313,10 @@ fn drive_in_flight(
                 state,
             )?,
             _ => {
+                let closed = match entry.stage {
+                    Stage::Recovered => "clear delivered, reload handed over by the injector",
+                    _ => "clear and go both delivered",
+                };
                 state.sessions.insert(
                     sid.clone(),
                     Entry {
@@ -231,7 +324,7 @@ fn drive_in_flight(
                         ..entry.clone()
                     },
                 );
-                Action::new(&sid, &entry.job, "done", "clear and go both delivered")
+                Action::new(&sid, &entry.job, "done", closed)
             }
         });
     }
@@ -308,7 +401,7 @@ fn send_clear(
                 format!("dry run, {why}"),
             ));
         }
-        return Ok(match rearm(&cand.sid, cand.arm.pid) {
+        return Ok(match rearm(&cand.sid, cand.arm.pid, job.cwd.as_deref()) {
             Ok(()) => Action::new(
                 &cand.sid,
                 &cand.job,
@@ -356,7 +449,11 @@ fn send_clear(
 struct InFlight<'a> {
     sid: &'a str,
     job: &'a str,
-    transcript: &'a Path,
+    /// `None` on the stranded-arm path, which has no transcript to read and
+    /// no concatenation to check: the clear it is recovering from happened
+    /// under a previous run of this binary.
+    transcript: Option<&'a Path>,
+    pending: &'a Path,
 }
 
 /// `go` is only earned once the reload is proven to have reached a context:
@@ -364,6 +461,7 @@ struct InFlight<'a> {
 /// in the session that received it (spec D9).
 fn after_clear(
     control: &control::Control,
+    jobs: &[control::Job],
     t: &InFlight,
     entry: &Entry,
     now: SystemTime,
@@ -419,7 +517,7 @@ fn after_clear(
             // The one detector for the guard having been wrong. A real /clear
             // is a command entry; a concatenated one arrives as an ordinary
             // prompt with the command buried inside it.
-            if let Some(why) = concatenation_seen(transcript, since) {
+            if let Some(why) = transcript.and_then(|p| concatenation_seen(p, since)) {
                 disarm_fleet(&why)?;
                 state.sessions.insert(
                     sid.to_string(),
@@ -431,15 +529,117 @@ fn after_clear(
                 );
                 return Ok(Action::new(sid, job, "tripwire", why));
             }
-            state.sessions.remove(sid);
-            Ok(Action::new(
-                sid,
-                job,
-                "retry",
-                "no reload after the clear; will re-arm the attempt",
-            ))
+            recover(control, jobs, t, entry, now, opts, state)
         }
     }
+}
+
+/// The `/clear` landed but the hook never consumed the arm, so the fresh
+/// context got nothing. A cleared sid is dead the instant it is cleared and
+/// can never come back as a candidate, so the old "retry" was a silent
+/// give-up that left the session empty for good - three of them on partly on
+/// 2026-09-09. Hand the armed reload to the new context instead: same job,
+/// same socket, and the box is empty because this injector emptied it.
+fn recover(
+    control: &control::Control,
+    jobs: &[control::Job],
+    t: &InFlight,
+    entry: &Entry,
+    now: SystemTime,
+    opts: &InjectOpts,
+    state: &mut State,
+) -> Result<Action> {
+    let Some(arm) = sentinel::read(t.pending, &sentinel::key(t.sid)) else {
+        // The hook consumed it after all, so what failed is the delivery
+        // PROOF, not the delivery. Re-typing here would double the reload.
+        state.sessions.remove(t.sid);
+        return Ok(Action::new(
+            t.sid,
+            t.job,
+            "retry",
+            "arm already consumed, nothing to re-deliver",
+        ));
+    };
+    let live = jobs.iter().find(|j| j.short == t.job);
+    // The daemon's own view of which session this job runs. An accepted
+    // `/clear` that the TUI never executed is indistinguishable from a clear
+    // whose hook declined - both leave no emit row - and the difference
+    // matters here, because recovery types a whole reload rather than six
+    // characters. If the job still runs the session we cleared, no clear
+    // happened and that context is intact: never paste into it.
+    if live.and_then(|j| j.session_id.as_deref()).unwrap_or(t.sid) == t.sid {
+        return Ok(Action::new(
+            t.sid,
+            t.job,
+            "wait",
+            "the clear has not landed yet; the job still runs this session",
+        ));
+    }
+    if live.is_some_and(control::Job::is_busy) {
+        return Ok(Action::new(
+            t.sid,
+            t.job,
+            "wait",
+            "reload never landed, worker busy; recovering next pass",
+        ));
+    }
+    // send_clear refuses an attached job because that is the only window in
+    // which the box can change under the two reads; the payload here is 400x
+    // larger, so the guard matters more, not less.
+    if attached_client(t.job) {
+        return Ok(Action::new(
+            t.sid,
+            t.job,
+            "wait",
+            "reload never landed, a client is attached; recovering next pass",
+        ));
+    }
+    let box_state = prompt_box(t.job)?;
+    if !box_state.may_type() {
+        return Ok(Action::new(
+            t.sid,
+            t.job,
+            "wait",
+            format!("reload never landed, {}", box_state.reason()),
+        ));
+    }
+    if opts.dry_run {
+        return Ok(Action::new(
+            t.sid,
+            t.job,
+            "would-recover",
+            "dry run, reload never landed",
+        ));
+    }
+    control.reply(t.job, arm.reload.trim())?;
+    // Consumed here because the hook never will: a surviving arm is what a
+    // later /clear in this root would GC, or worse, cross-load.
+    sentinel::remove(&arm);
+    let key = sentinel::key(t.sid);
+    let _ = emit::log(
+        &paths::emit_log()?,
+        "recover",
+        t.sid,
+        t.job,
+        arm.cwd.as_deref().unwrap_or(""),
+        &key,
+        "?",
+    );
+    state.sessions.insert(
+        t.sid.to_string(),
+        Entry {
+            stage: Stage::Recovered,
+            at: secs(now),
+            attempts: entry.attempts + 1,
+            ..entry.clone()
+        },
+    );
+    Ok(Action::new(
+        t.sid,
+        t.job,
+        "recover",
+        "hook dropped the arm; delivered the reload by hand",
+    ))
 }
 
 /// The session id that received this arm's reload, if the emit log and the
@@ -542,11 +742,12 @@ fn candidates(now: SystemTime) -> Result<Vec<Candidate>> {
 /// Distil the session again so its bundle is current, then let the next pass
 /// clear it. Synchronous: `arm::run` writes the sentinel last, so on return
 /// the bundle is whole rather than half-written.
-fn rearm(sid: &str, pid: Option<u32>) -> Result<()> {
+fn rearm(sid: &str, pid: Option<u32>, cwd: Option<&str>) -> Result<()> {
     arm::run(arm::ArmOpts {
         sid: Some(sid.to_string()),
         quiet: true,
         pid,
+        cwd: cwd.map(str::to_string),
     })
     .map(|_| ())
 }
@@ -744,6 +945,121 @@ mod tests {
         assert!(!in_clear_band(0, None, 240_000));
     }
 
+    fn in_flight<'a>(sid: &'a str, job: &'a str, t: &'a Path, pending: &'a Path) -> InFlight<'a> {
+        InFlight {
+            sid,
+            job,
+            transcript: Some(t),
+            pending,
+        }
+    }
+
+    fn job(short: &str, tempo: &str, session_id: Option<&str>) -> control::Job {
+        control::Job {
+            short: short.into(),
+            session_id: session_id.map(str::to_string),
+            tempo: Some(tempo.into()),
+            state: None,
+            cwd: None,
+            pid: None,
+        }
+    }
+
+    /// The hook DID consume the arm and only the proof failed, so re-typing
+    /// would deliver the reload twice into the same context.
+    #[test]
+    fn a_consumed_arm_is_never_re_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = control::Control::new(dir.path().join("nope.sock"), "k".into());
+        let mut state = State::default();
+        state
+            .sessions
+            .insert("a0e9d562-111e".into(), entry(Stage::ClearSent, "a0e9d562"));
+        let t = dir.path().join("t.jsonl");
+        let action = recover(
+            &control,
+            &[job("a0e9d562", "idle", Some("fresh-sid"))],
+            &in_flight("a0e9d562-111e", "a0e9d562", &t, dir.path()),
+            &entry(Stage::ClearSent, "a0e9d562"),
+            SystemTime::now(),
+            &InjectOpts {
+                dry_run: false,
+                only: None,
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(action.did, "retry");
+        assert!(action.why.contains("already consumed"));
+        assert!(!state.sessions.contains_key("a0e9d562-111e"));
+    }
+
+    /// The daemon accepting `/clear` is not the same as the TUI running it,
+    /// and both look identical in the emit log. If the job still runs the
+    /// session we meant to clear, its context is intact: a 2.3KB paste there
+    /// would land in a live near-limit thread.
+    #[test]
+    fn a_clear_that_never_landed_is_not_recovered_over() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a0e9d562-111e"), "RELOAD BODY").unwrap();
+        let control = control::Control::new(dir.path().join("nope.sock"), "k".into());
+        let mut state = State::default();
+        state
+            .sessions
+            .insert("a0e9d562-111e".into(), entry(Stage::ClearSent, "a0e9d562"));
+        let t = dir.path().join("t.jsonl");
+        let action = recover(
+            &control,
+            // The job still runs the very session the clear was typed into.
+            &[job("a0e9d562", "idle", Some("a0e9d562-111e"))],
+            &in_flight("a0e9d562-111e", "a0e9d562", &t, dir.path()),
+            &entry(Stage::ClearSent, "a0e9d562"),
+            SystemTime::now(),
+            &InjectOpts {
+                dry_run: false,
+                only: None,
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(action.did, "wait");
+        assert!(action.why.contains("has not landed"));
+        assert!(dir.path().join("a0e9d562-111e").exists(), "arm untouched");
+    }
+
+    /// A busy worker must postpone the recovery, never abandon it: the entry
+    /// stays ClearSent so the next pass comes straight back here.
+    #[test]
+    fn a_busy_worker_postpones_the_recovery_rather_than_dropping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a0e9d562-111e"), "RELOAD BODY").unwrap();
+        let control = control::Control::new(dir.path().join("nope.sock"), "k".into());
+        let mut state = State::default();
+        state
+            .sessions
+            .insert("a0e9d562-111e".into(), entry(Stage::ClearSent, "a0e9d562"));
+        let t = dir.path().join("t.jsonl");
+        let action = recover(
+            &control,
+            &[job("a0e9d562", "active", Some("fresh-sid"))],
+            &in_flight("a0e9d562-111e", "a0e9d562", &t, dir.path()),
+            &entry(Stage::ClearSent, "a0e9d562"),
+            SystemTime::now(),
+            &InjectOpts {
+                dry_run: false,
+                only: None,
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(action.did, "wait");
+        assert_eq!(
+            state.sessions["a0e9d562-111e"].stage,
+            Stage::ClearSent,
+            "the entry must survive or the session is stranded for good"
+        );
+    }
+
     #[test]
     fn only_identity_tiers_prove_a_reload() {
         assert!(is_identity_tier("1"));
@@ -752,6 +1068,11 @@ mod tests {
         assert!(is_identity_tier("2-jobmatch"));
         assert!(!is_identity_tier("3"));
         assert!(!is_identity_tier("3-declined-cwdonly-fresh"));
+        assert!(is_identity_tier("1-stale"));
+        assert!(is_identity_tier("2-stale"));
+        assert!(is_identity_tier("2-jobmatch-stale"));
+        // The injector's own hand-delivery must never prove a later arm.
+        assert!(!is_identity_tier("recover"));
     }
 
     #[test]
