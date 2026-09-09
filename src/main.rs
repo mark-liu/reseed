@@ -95,6 +95,10 @@ enum Command {
         sid: Option<String>,
         #[arg(long)]
         pid: Option<u32>,
+        /// The target session's work dir. Needed on the detached rearm path,
+        /// where the process cwd is launchd's `/`, not the session's.
+        #[arg(long)]
+        cwd: Option<String>,
     },
     /// SessionStart(clear) hook: emit an armed reload, if any. Reads the
     /// SessionStart payload from stdin when stdin is not a terminal.
@@ -168,8 +172,18 @@ fn main() -> Result<()> {
             launch_claude(&bundle_dir)
         }
         Command::Ctx { transcript, json } => run_ctx(&transcript, json),
-        Command::Arm { quiet, sid, pid } => {
-            let dir = arm::run(arm::ArmOpts { sid, quiet, pid })?;
+        Command::Arm {
+            quiet,
+            sid,
+            pid,
+            cwd,
+        } => {
+            let dir = arm::run(arm::ArmOpts {
+                sid,
+                quiet,
+                pid,
+                cwd,
+            })?;
             if quiet {
                 Ok(())
             } else {
