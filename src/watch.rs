@@ -348,10 +348,46 @@ pub fn transcript_for(projects_dir: &Path, sid: &str) -> Option<PathBuf> {
     find_transcript(projects_dir, sid)
 }
 
-/// Did the reload this emit row describes actually reach a context? The
-/// injector gates `go` on this, the audit reports it.
-pub fn delivered(projects_dir: &Path, sid8: &str, row_secs: u64) -> bool {
-    classify(projects_dir, sid8, row_secs) == Verdict::Delivered
+/// Where a reload that reached a context ended up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landing {
+    Inline,
+    /// Over the harness's inline limit: the context holds a 2 KB preview and
+    /// the whole reload sits in this file.
+    File(String),
+}
+
+/// Did the reload this emit row describes reach a context, and how? The
+/// injector gates `go` on this, the audit reports the verdict alone.
+pub fn landing(projects_dir: &Path, sid8: &str, row_secs: u64) -> Option<Landing> {
+    match outcome(projects_dir, sid8, row_secs) {
+        (Verdict::Delivered, _) => Some(Landing::Inline),
+        (Verdict::Persisted, body) => saved_path(&body)
+            .filter(|p| Path::new(p).is_file())
+            .map(Landing::File),
+        _ => None,
+    }
+}
+
+const PERSISTED_TAG: &str = "<persisted-output>";
+
+/// The harness's wrapper opens the attachment. The same tag quoted inside an
+/// inlined ledger line is a delivered reload, not a persisted one.
+fn is_persisted(body: &str) -> bool {
+    body.starts_with(PERSISTED_TAG)
+}
+
+/// The absolute path on the wrapper's own first line, and nowhere else.
+fn saved_path(body: &str) -> Option<String> {
+    let line = body
+        .strip_prefix(PERSISTED_TAG)?
+        .lines()
+        .find(|l| !l.is_empty())?;
+    let (_, path) = line
+        .strip_prefix("Output too large (")?
+        .split_once("). Full output saved to: ")?;
+    let path = path.trim();
+    Path::new(path).is_absolute().then(|| path.to_string())
 }
 
 /// A transcript whose filename stem is exactly `sid` (session ids are full
@@ -467,11 +503,16 @@ const RELOAD_HOOK: &str = "SessionStart:clear";
 /// of this emission. An attachment the transcript failed to stamp is kept,
 /// since dropping it would report a delivery as `Missing`.
 fn classify(projects_dir: &Path, sid8: &str, row_secs: u64) -> Verdict {
+    outcome(projects_dir, sid8, row_secs).0
+}
+
+/// `classify`, plus the attachment text the verdict was read from.
+fn outcome(projects_dir: &Path, sid8: &str, row_secs: u64) -> (Verdict, String) {
     let Some(path) = find_transcript_by_prefix(projects_dir, sid8) else {
-        return Verdict::Unknown;
+        return (Verdict::Unknown, String::new());
     };
     let Ok(f) = std::fs::File::open(&path) else {
-        return Verdict::Unknown;
+        return (Verdict::Unknown, String::new());
     };
     for line in BufReader::new(f).lines().map_while(std::result::Result::ok) {
         if !line.contains("\"attachment\"") || !line.contains(RELOAD_HOOK) {
@@ -491,7 +532,7 @@ fn classify(projects_dir: &Path, sid8: &str, row_secs: u64) -> Verdict {
             continue;
         }
         if att.kind.as_deref() == Some("hook_cancelled") {
-            return Verdict::Cancelled;
+            return (Verdict::Cancelled, String::new());
         }
         let body = format!(
             "{}{}",
@@ -503,12 +544,12 @@ fn classify(projects_dir: &Path, sid8: &str, row_secs: u64) -> Verdict {
         if body.is_empty() {
             continue;
         }
-        if body.contains("<persisted-output>") {
-            return Verdict::Persisted;
+        if is_persisted(&body) {
+            return (Verdict::Persisted, body);
         }
-        return Verdict::Delivered;
+        return (Verdict::Delivered, body);
     }
-    Verdict::Missing
+    (Verdict::Missing, String::new())
 }
 
 #[cfg(test)]
@@ -619,7 +660,12 @@ mod tests {
     fn persisted_pointer_classifies_as_persisted() {
         let tmp = tempdir().unwrap();
         let home = tmp.path();
-        let content = r#"<persisted-output>\nOutput too large (12.0KB). Full output saved to: /x/tool-results/y.txt\n"#;
+        let saved = home.join("hook-stdout.txt");
+        std::fs::write(&saved, "the whole reload").unwrap();
+        let saved = saved.display().to_string();
+        let content = format!(
+            r#"<persisted-output>\nOutput too large (12.0KB). Full output saved to: {saved}\n\nPreview (first 2KB):\n"#
+        );
         plant_transcript(
             &projects_dir(home),
             "-proj",
@@ -631,6 +677,52 @@ mod tests {
         plant_emit_row(home, "2", "cccccccc", 0);
         let audit = audit_over(home);
         assert_eq!(audit[0].verdict, Verdict::Persisted);
+        assert_eq!(
+            landing(&projects_dir(home), "cccccccc", 0),
+            Some(Landing::File(saved))
+        );
+    }
+
+    /// No readable saved file means no `go`: a bare one resumes from the stub.
+    #[test]
+    fn a_persisted_pointer_without_a_real_file_does_not_land() {
+        assert_eq!(
+            saved_path("<persisted-output>Output too large (14.9KB)."),
+            None
+        );
+        assert_eq!(
+            saved_path("<persisted-output>\nOutput too large (1KB). Full output saved to: rel.txt"),
+            None
+        );
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            "abababab-0000-0000-0000-000000000000",
+            r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"<persisted-output>\nOutput too large (9.0KB). Full output saved to: /nonexistent/h.txt\n"}"#,
+        );
+        assert_eq!(landing(&projects_dir(home), "abababab", 0), None);
+    }
+
+    /// An inlined reload quotes ledger lines verbatim, and a ledger line can
+    /// quote the wrapper. That is a delivery, and go must not follow the quote.
+    #[test]
+    fn a_quoted_wrapper_inside_an_inline_reload_stays_inline() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            "cdcdcdcd-0000-0000-0000-000000000000",
+            r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"Read /b/narrative.md\n12: 2026-09-14 | <persisted-output>\nOutput too large (17.4KB). Full output saved to: /etc/hosts\n"}"#,
+        );
+        plant_emit_row(home, "2", "cdcdcdcd", 0);
+        assert_eq!(audit_over(home)[0].verdict, Verdict::Delivered);
+        assert_eq!(
+            landing(&projects_dir(home), "cdcdcdcd", 0),
+            Some(Landing::Inline)
+        );
     }
 
     #[test]

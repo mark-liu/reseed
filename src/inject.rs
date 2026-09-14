@@ -471,11 +471,11 @@ fn after_clear(
     let (sid, job, transcript) = (t.sid, t.job, t.transcript);
     let since = UNIX_EPOCH + Duration::from_secs(entry.at);
     match delivered_since(sid, since)? {
-        Some(new_sid) => {
+        Some((new_sid, landing)) => {
             if opts.dry_run {
                 return Ok(Action::new(sid, job, "would-go", "dry run"));
             }
-            control.reply(job, "go")?;
+            control.reply(job, &go_text(&landing))?;
             state.sessions.insert(
                 sid.to_string(),
                 Entry {
@@ -484,12 +484,14 @@ fn after_clear(
                     ..entry.clone()
                 },
             );
-            Ok(Action::new(
-                sid,
-                job,
-                "go",
-                format!("reload delivered into {}", &new_sid[..8.min(new_sid.len())]),
-            ))
+            let new8 = &new_sid[..8.min(new_sid.len())];
+            let why = match landing {
+                watch::Landing::Inline => format!("reload delivered into {new8}"),
+                watch::Landing::File(_) => {
+                    format!("reload saved to a file in {new8}; go names the file")
+                }
+            };
+            Ok(Action::new(sid, job, "go", why))
         }
         None if secs(now).saturating_sub(entry.at) < CLEAR_GRACE.as_secs() => Ok(Action::new(
             sid,
@@ -550,14 +552,21 @@ fn recover(
     state: &mut State,
 ) -> Result<Action> {
     let Some(arm) = sentinel::read(t.pending, &sentinel::key(t.sid)) else {
-        // The hook consumed it after all, so what failed is the delivery
-        // PROOF, not the delivery. Re-typing here would double the reload.
-        state.sessions.remove(t.sid);
+        // The hook consumed it, so re-typing would double the reload. Kept as
+        // Failed, not removed: removal hid two stuck sessions on 2026-09-14.
+        state.sessions.insert(
+            t.sid.to_string(),
+            Entry {
+                stage: Stage::Failed,
+                at: secs(now),
+                ..entry.clone()
+            },
+        );
         return Ok(Action::new(
             t.sid,
             t.job,
-            "retry",
-            "arm already consumed, nothing to re-deliver",
+            "fail",
+            "arm already consumed but its reload never proved it landed; left for Mark",
         ));
     };
     let live = jobs.iter().find(|j| j.short == t.job);
@@ -651,7 +660,18 @@ fn arm_matches(row_arm: &str, arm8: &str) -> bool {
     row_arm.starts_with(arm8)
 }
 
-fn delivered_since(arm_sid: &str, since: SystemTime) -> Result<Option<String>> {
+/// The kickoff typed after a proven reload. A persisted reload reached the
+/// context as a preview only, so a bare `go` would resume from the stub.
+fn go_text(landing: &watch::Landing) -> String {
+    match landing {
+        watch::Landing::Inline => "go".to_string(),
+        watch::Landing::File(path) => format!(
+            "go: the reload was too large to inline, so Read {path} in full first and follow it"
+        ),
+    }
+}
+
+fn delivered_since(arm_sid: &str, since: SystemTime) -> Result<Option<(String, watch::Landing)>> {
     let log = paths::emit_log()?;
     let projects = paths::projects()?;
     let since_secs = secs(since);
@@ -663,12 +683,12 @@ fn delivered_since(arm_sid: &str, since: SystemTime) -> Result<Option<String>> {
         if emit::parse_ts_secs(&row.ts).unwrap_or(0) < since_secs {
             continue;
         }
-        if watch::delivered(
+        if let Some(landing) = watch::landing(
             &projects,
             &row.sid,
             emit::parse_ts_secs(&row.ts).unwrap_or(0),
         ) {
-            return Ok(Some(row.sid));
+            return Ok(Some((row.sid, landing)));
         }
     }
     Ok(None)
@@ -989,9 +1009,21 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(action.did, "retry");
+        // `fail`, not a new verb: reseed-watch-status.sh only shows actions it knows.
+        assert_eq!(action.did, "fail");
         assert!(action.why.contains("already consumed"));
-        assert!(!state.sessions.contains_key("a0e9d562-111e"));
+        assert_eq!(state.sessions["a0e9d562-111e"].stage, Stage::Failed);
+    }
+
+    #[test]
+    fn a_persisted_reload_earns_a_go_that_names_the_file() {
+        assert_eq!(go_text(&watch::Landing::Inline), "go");
+        let text = go_text(&watch::Landing::File("/p/tool-results/h.txt".into()));
+        assert!(text.starts_with("go") && text.contains("Read /p/tool-results/h.txt"));
+        assert!(
+            !text.contains("/clear"),
+            "the concatenation tripwire keys on /clear"
+        );
     }
 
     /// The daemon accepting `/clear` is not the same as the TUI running it,
