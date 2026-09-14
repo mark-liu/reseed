@@ -353,8 +353,8 @@ pub fn transcript_for(projects_dir: &Path, sid: &str) -> Option<PathBuf> {
 pub enum Landing {
     Inline,
     /// Over the harness's inline limit: the context holds a 2 KB preview that
-    /// names the bundle, and the whole hook output sits in this file.
-    File(String),
+    /// names the bundle. The saved whole output is a courtesy, never the proof.
+    Persisted(Option<String>),
 }
 
 /// Did the reload this emit row describes reach a context, and how? The
@@ -363,9 +363,9 @@ pub enum Landing {
 pub fn landing(projects_dir: &Path, sid8: &str, row_secs: u64, arm: &str) -> Option<Landing> {
     match outcome(projects_dir, sid8, row_secs) {
         (Verdict::Delivered, _) => Some(Landing::Inline),
-        (Verdict::Persisted, preview) if names_bundle(&preview, arm) => saved_path(&preview)
-            .filter(|p| Path::new(p).is_file())
-            .map(Landing::File),
+        (Verdict::Persisted, preview) if names_bundle(&preview, arm) => Some(Landing::Persisted(
+            saved_path(&preview).filter(|p| Path::new(p).is_file()),
+        )),
         _ => None,
     }
 }
@@ -692,7 +692,22 @@ mod tests {
         assert_eq!(audit[0].verdict, Verdict::Persisted);
         assert_eq!(
             landing(&projects_dir(home), "cccccccc", 0, ARM),
-            Some(Landing::File(saved))
+            Some(Landing::Persisted(Some(saved)))
+        );
+    }
+
+    /// The pointer is the proof. A saved file gone before the next pass must
+    /// not turn a delivered reload into a consumed-arm `fail`.
+    #[test]
+    fn a_pointer_lands_even_when_the_saved_file_is_gone() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let preview = format!("Read /h/.claude/reseed/{ARM}/narrative.md");
+        let saved = plant_persisted(home, "c5c5c5c5-0000-0000-0000-000000000000", &preview, "");
+        std::fs::remove_file(saved).unwrap();
+        assert_eq!(
+            landing(&projects_dir(home), "c5c5c5c5", 0, ARM),
+            Some(Landing::Persisted(None))
         );
     }
 
@@ -736,9 +751,9 @@ mod tests {
         }
     }
 
-    /// No readable saved file means no `go`: a bare one resumes from the stub.
+    /// Only an absolute path on the wrapper's own line is named in the go.
     #[test]
-    fn a_persisted_pointer_without_a_real_file_does_not_land() {
+    fn the_saved_path_parses_only_from_the_wrapper_line() {
         assert_eq!(
             saved_path("<persisted-output>Output too large (14.9KB)."),
             None
@@ -747,15 +762,6 @@ mod tests {
             saved_path("<persisted-output>\nOutput too large (1KB). Full output saved to: rel.txt"),
             None
         );
-        let tmp = tempdir().unwrap();
-        let home = tmp.path();
-        plant_transcript(
-            &projects_dir(home),
-            "-proj",
-            "abababab-0000-0000-0000-000000000000",
-            r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"<persisted-output>\nOutput too large (9.0KB). Full output saved to: /nonexistent/h.txt\n"}"#,
-        );
-        assert_eq!(landing(&projects_dir(home), "abababab", 0, ARM), None);
     }
 
     /// An inlined reload quotes ledger lines verbatim, and a ledger line can

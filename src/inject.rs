@@ -487,7 +487,7 @@ fn after_clear(
             let new8 = &new_sid[..8.min(new_sid.len())];
             let why = match landing {
                 watch::Landing::Inline => format!("reload delivered into {new8}"),
-                watch::Landing::File(_) => {
+                watch::Landing::Persisted(_) => {
                     format!("reload persisted in {new8}; preview carries the pointer, go names the file")
                 }
             };
@@ -666,7 +666,11 @@ fn arm_matches(row_arm: &str, arm8: &str) -> bool {
 fn go_text(landing: &watch::Landing) -> String {
     match landing {
         watch::Landing::Inline => "go".to_string(),
-        watch::Landing::File(path) => format!(
+        watch::Landing::Persisted(None) => {
+            "go: the reload was too large to inline; follow the pointer in its preview above"
+                .to_string()
+        }
+        watch::Landing::Persisted(Some(path)) => format!(
             "go: the reload was too large to inline; follow the pointer in its preview above, and the full hook output is at {path}"
         ),
     }
@@ -1020,12 +1024,18 @@ mod tests {
     #[test]
     fn a_persisted_reload_earns_a_go_that_names_the_file() {
         assert_eq!(go_text(&watch::Landing::Inline), "go");
-        let text = go_text(&watch::Landing::File("/p/tool-results/h.txt".into()));
-        assert!(text.starts_with("go") && text.ends_with("at /p/tool-results/h.txt"));
-        assert!(
-            !text.contains("/clear"),
-            "the concatenation tripwire keys on /clear"
-        );
+        let named = go_text(&watch::Landing::Persisted(Some(
+            "/p/tool-results/h.txt".into(),
+        )));
+        assert!(named.starts_with("go") && named.ends_with("at /p/tool-results/h.txt"));
+        let bare = go_text(&watch::Landing::Persisted(None));
+        assert!(bare.starts_with("go") && bare.ends_with("preview above"));
+        for text in [named, bare] {
+            assert!(
+                !text.contains("/clear"),
+                "the concatenation tripwire keys on /clear"
+            );
+        }
     }
 
     /// The daemon accepting `/clear` is not the same as the TUI running it,
