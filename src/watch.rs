@@ -352,21 +352,28 @@ pub fn transcript_for(projects_dir: &Path, sid: &str) -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landing {
     Inline,
-    /// Over the harness's inline limit: the context holds a 2 KB preview and
-    /// the whole reload sits in this file.
+    /// Over the harness's inline limit: the context holds a 2 KB preview that
+    /// names the bundle, and the whole hook output sits in this file.
     File(String),
 }
 
 /// Did the reload this emit row describes reach a context, and how? The
-/// injector gates `go` on this, the audit reports the verdict alone.
-pub fn landing(projects_dir: &Path, sid8: &str, row_secs: u64) -> Option<Landing> {
+/// injector gates `go` on this, the audit reports the verdict alone. `arm` is
+/// the cleared session whose bundle the reload points at.
+pub fn landing(projects_dir: &Path, sid8: &str, row_secs: u64, arm: &str) -> Option<Landing> {
     match outcome(projects_dir, sid8, row_secs) {
         (Verdict::Delivered, _) => Some(Landing::Inline),
-        (Verdict::Persisted, body) => saved_path(&body)
+        (Verdict::Persisted, preview) if names_bundle(&preview, arm) => saved_path(&preview)
             .filter(|p| Path::new(p).is_file())
             .map(Landing::File),
         _ => None,
     }
+}
+
+/// The same standard an inline reload meets: the pointer reached the context.
+/// The park header says "narrative.md" too, so only this arm's path counts.
+fn names_bundle(preview: &str, arm: &str) -> bool {
+    !arm.is_empty() && preview.contains(&format!("/{arm}/narrative.md"))
 }
 
 const PERSISTED_TAG: &str = "<persisted-output>";
@@ -534,18 +541,17 @@ fn outcome(projects_dir: &Path, sid8: &str, row_secs: u64) -> (Verdict, String) 
         if att.kind.as_deref() == Some("hook_cancelled") {
             return (Verdict::Cancelled, String::new());
         }
-        let body = format!(
-            "{}{}",
-            att.content.as_deref().unwrap_or(""),
-            att.stdout.as_deref().unwrap_or(""),
-        );
+        let content = att.content.as_deref().unwrap_or("");
+        let body = format!("{content}{}", att.stdout.as_deref().unwrap_or(""));
         // An attachment that carried no text is not evidence of a delivery;
         // the emission's real outcome, if any, is a later attachment.
         if body.is_empty() {
             continue;
         }
-        if is_persisted(&body) {
-            return (Verdict::Persisted, body);
+        // `stdout` keeps the whole output even when persisted; only `content`
+        // reached the context, so a pointer found in `stdout` proves nothing.
+        if is_persisted(content) {
+            return (Verdict::Persisted, content.to_string());
         }
         return (Verdict::Delivered, body);
     }
@@ -656,31 +662,78 @@ mod tests {
         assert_eq!(audit[0].verdict, Verdict::Cancelled);
     }
 
+    const ARM: &str = "0678549e-8d6c-4b25-82ab-d2ac380d5acc";
+
+    /// A persisted clear attachment: the harness wrapper plus `preview` in
+    /// `content`, and `stdout` holding whatever the hook really printed.
+    fn plant_persisted(home: &Path, sid: &str, preview: &str, stdout: &str) -> String {
+        let saved = home.join(format!("{}-hook-stdout.txt", &sid[..8]));
+        std::fs::write(&saved, "the whole reload").unwrap();
+        let saved = saved.display().to_string();
+        plant_transcript(
+            &projects_dir(home),
+            "-proj",
+            sid,
+            &format!(
+                r#"{{"type":"hook_success","hookName":"SessionStart:clear","content":"<persisted-output>\nOutput too large (12.0KB). Full output saved to: {saved}\n\nPreview (first 2KB):\n{preview}","stdout":"{stdout}"}}"#
+            ),
+        );
+        saved
+    }
+
     #[test]
     fn persisted_pointer_classifies_as_persisted() {
         let tmp = tempdir().unwrap();
         let home = tmp.path();
-        let saved = home.join("hook-stdout.txt");
-        std::fs::write(&saved, "the whole reload").unwrap();
-        let saved = saved.display().to_string();
-        let content = format!(
-            r#"<persisted-output>\nOutput too large (12.0KB). Full output saved to: {saved}\n\nPreview (first 2KB):\n"#
-        );
-        plant_transcript(
-            &projects_dir(home),
-            "-proj",
-            "cccccccc-0000-0000-0000-000000000000",
-            &format!(
-                r#"{{"type":"hook_success","hookName":"SessionStart:clear","content":"{content}"}}"#
-            ),
-        );
+        let preview = format!("Read /h/.claude/reseed/{ARM}/narrative.md in chunks");
+        let saved = plant_persisted(home, "cccccccc-0000-0000-0000-000000000000", &preview, "");
         plant_emit_row(home, "2", "cccccccc", 0);
         let audit = audit_over(home);
         assert_eq!(audit[0].verdict, Verdict::Persisted);
         assert_eq!(
-            landing(&projects_dir(home), "cccccccc", 0),
+            landing(&projects_dir(home), "cccccccc", 0, ARM),
             Some(Landing::File(saved))
         );
+    }
+
+    /// The preview is the whole of what the context holds. Without this arm's
+    /// pointer in it, the go has nothing to resume from and the arm must fail.
+    #[test]
+    fn a_preview_without_this_arms_pointer_does_not_land() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let other = "cd9dd813-54bb-4525-a168-6a19b55f1df0";
+        let full = format!("Read /h/.claude/reseed/{ARM}/narrative.md");
+        let cases = [
+            (
+                "c1c1c1c1-0000-0000-0000-000000000000",
+                "provenance only, cut".to_string(),
+                String::new(),
+            ),
+            (
+                "c2c2c2c2-0000-0000-0000-000000000000",
+                "verify it against narrative.md".to_string(),
+                String::new(),
+            ),
+            (
+                "c3c3c3c3-0000-0000-0000-000000000000",
+                format!("Read /h/.claude/reseed/{other}/narrative.md"),
+                String::new(),
+            ),
+            (
+                "c4c4c4c4-0000-0000-0000-000000000000",
+                "provenance only, cut".to_string(),
+                full,
+            ),
+        ];
+        for (sid, preview, stdout) in &cases {
+            plant_persisted(home, sid, preview, stdout);
+            assert_eq!(
+                landing(&projects_dir(home), &sid[..8], 0, ARM),
+                None,
+                "preview {preview:?} with stdout {stdout:?}"
+            );
+        }
     }
 
     /// No readable saved file means no `go`: a bare one resumes from the stub.
@@ -702,7 +755,7 @@ mod tests {
             "abababab-0000-0000-0000-000000000000",
             r#"{"type":"hook_success","hookName":"SessionStart:clear","content":"<persisted-output>\nOutput too large (9.0KB). Full output saved to: /nonexistent/h.txt\n"}"#,
         );
-        assert_eq!(landing(&projects_dir(home), "abababab", 0), None);
+        assert_eq!(landing(&projects_dir(home), "abababab", 0, ARM), None);
     }
 
     /// An inlined reload quotes ledger lines verbatim, and a ledger line can
@@ -720,7 +773,7 @@ mod tests {
         plant_emit_row(home, "2", "cdcdcdcd", 0);
         assert_eq!(audit_over(home)[0].verdict, Verdict::Delivered);
         assert_eq!(
-            landing(&projects_dir(home), "cdcdcdcd", 0),
+            landing(&projects_dir(home), "cdcdcdcd", 0, ARM),
             Some(Landing::Inline)
         );
     }
