@@ -488,7 +488,7 @@ fn after_clear(
             let why = match landing {
                 watch::Landing::Inline => format!("reload delivered into {new8}"),
                 watch::Landing::File(_) => {
-                    format!("reload saved to a file in {new8}; go names the file")
+                    format!("reload persisted in {new8}; preview carries the pointer, go names the file")
                 }
             };
             Ok(Action::new(sid, job, "go", why))
@@ -661,12 +661,13 @@ fn arm_matches(row_arm: &str, arm8: &str) -> bool {
 }
 
 /// The kickoff typed after a proven reload. A persisted reload reached the
-/// context as a preview only, so a bare `go` would resume from the stub.
+/// context as a preview whose pointer already says how to read the bundle, so
+/// the go defers to it rather than issuing a competing read order.
 fn go_text(landing: &watch::Landing) -> String {
     match landing {
         watch::Landing::Inline => "go".to_string(),
         watch::Landing::File(path) => format!(
-            "go: the reload was too large to inline, so Read {path} in full first and follow it"
+            "go: the reload was too large to inline; follow the pointer in its preview above, and the full hook output is at {path}"
         ),
     }
 }
@@ -687,6 +688,7 @@ fn delivered_since(arm_sid: &str, since: SystemTime) -> Result<Option<(String, w
             &projects,
             &row.sid,
             emit::parse_ts_secs(&row.ts).unwrap_or(0),
+            arm_sid,
         ) {
             return Ok(Some((row.sid, landing)));
         }
@@ -1019,7 +1021,7 @@ mod tests {
     fn a_persisted_reload_earns_a_go_that_names_the_file() {
         assert_eq!(go_text(&watch::Landing::Inline), "go");
         let text = go_text(&watch::Landing::File("/p/tool-results/h.txt".into()));
-        assert!(text.starts_with("go") && text.contains("Read /p/tool-results/h.txt"));
+        assert!(text.starts_with("go") && text.ends_with("at /p/tool-results/h.txt"));
         assert!(
             !text.contains("/clear"),
             "the concatenation tripwire keys on /clear"
