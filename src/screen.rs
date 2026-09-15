@@ -95,6 +95,14 @@ fn addressed_geometry(stream: &[u8]) -> (u16, u16) {
         }
         i = start;
     }
+    // A fresh session may address no column past 3; its box borders span the
+    // full width, so the longest run of them is the width floor.
+    let border = text
+        .split(|c| c != '\u{2500}')
+        .map(|run| run.chars().count())
+        .max()
+        .unwrap_or(0);
+    let cols = cols.max(u16::try_from(border).unwrap_or(u16::MAX));
     (rows.min(MAX_ROWS), cols.saturating_add(8).min(MAX_COLS))
 }
 
@@ -271,6 +279,16 @@ mod tests {
         let stream = format!(
             "\u{1b}[130;1H\u{1b}[124;1H\u{1b}[K{border}\u{1b}[459G\u{1b}[127;1H\u{1b}[K\u{276f}\u{a0}\u{1b}[127;3H"
         );
+        assert_eq!(classify(stream.as_bytes()), BoxState::Empty);
+    }
+
+    #[test]
+    fn a_fresh_session_addressing_no_wide_column_still_renders_at_its_width() {
+        // CC 2.1.272 on a new 200-column job: borders drawn relative, caret at 47;3,
+        // no CHA or CUF past column 3. At 128 columns the top border wrapped.
+        let border = "\u{2500}".repeat(200);
+        let stream =
+            format!("\u{1b}[50;1H\u{1b}[45;1H{border}\r\n\u{276f}\u{a0}\r\n{border}\u{1b}[46;3H");
         assert_eq!(classify(stream.as_bytes()), BoxState::Empty);
     }
 
