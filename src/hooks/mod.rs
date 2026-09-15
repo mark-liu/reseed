@@ -8,12 +8,64 @@ pub mod nudge;
 pub mod override_;
 pub mod probe_guard;
 
+use crate::{msg, paths};
 use regex::Regex;
 use serde::Deserialize;
 use std::io::Read;
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 const STDIN_CAP: usize = 4_000_000;
+
+/// The watcher ticks every few seconds, so a quieter log means no pass runs.
+const WATCH_FRESH: Duration = Duration::from_secs(60);
+
+/// Public-safe fallbacks (P12) shared by the injector branch of every hook.
+const INJECTOR_STEP_DEFAULT: &str =
+    "This is a background job and the reseed injector is live: once this turn ends it \
+     runs /clear and types 'go' itself. Do NOT advise {op} to /clear or type 'go'.";
+
+/// Operator-facing, so it carries the fallback: a spawned rearm is not a
+/// written sentinel, and an attached viewer holds the injector off.
+const INJECTOR_NOTE_DEFAULT: &str =
+    "the injector auto-clears this job once the turn ends and nobody is attached or \
+     typing; if it is still here 2 min later, /clear then 'go'";
+
+/// True when `reseed watch --inject` will clear this session unaided. Only a
+/// background job has a daemon pty to type into, so a terminal session never
+/// is. The kill file is checked on its own because a stopped watcher still
+/// logs an `off` row every tick. Callers must also know a bundle is armed or
+/// distilling: the injector skips an unarmed session.
+pub fn injector_live() -> bool {
+    match std::env::var_os("CLAUDE_JOB_DIR") {
+        Some(v) if !v.is_empty() => {}
+        _ => return false,
+    }
+    let (Ok(kill), Ok(log)) = (paths::kill_file(), paths::watch_log()) else {
+        return false;
+    };
+    if kill.exists() {
+        return false;
+    }
+    // A future mtime (clock step) counts as fresh, as in the Python predicate.
+    std::fs::metadata(log)
+        .and_then(|m| m.modified())
+        .map(|t| SystemTime::now().duration_since(t).unwrap_or_default() < WATCH_FRESH)
+        .unwrap_or(false)
+}
+
+/// Model-facing: the injector does the reset, so do not ask for one.
+pub fn injector_step() -> String {
+    msg::fill(
+        &msg::text("injector-step", INJECTOR_STEP_DEFAULT),
+        &[("op", &msg::operator())],
+    )
+}
+
+/// Operator-facing banner tail for the injector branch.
+pub fn injector_note() -> String {
+    msg::text("injector-note", INJECTOR_NOTE_DEFAULT)
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Payload {

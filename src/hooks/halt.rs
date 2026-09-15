@@ -21,6 +21,23 @@ const HALT_DENY_DEFAULT: &str =
      blocked. Do NOT retry this call, do not route around it with another tool, and do \
      not ask for the override - only {op} can lift it, by typing 'override reset'.";
 
+/// The injector branch: `{step}` is `hooks::injector_step`.
+const HALT_DENY_INJECTOR_DEFAULT: &str =
+    "HALTED: context is ~{ctx}k, past the {line}k reset line. Work done from here is \
+     not in the reload bundle, so the session pauses instead of advising. {step} Write, \
+     in text, exactly where this task got to and what the next step is (the reloaded \
+     session reads it), then end the turn. If the `rename-thread` skill never fired at \
+     the nudge tier, this thread still carries a stale title and no tool call can fix \
+     that now - so END your handoff text with a suggested title line (`suggested \
+     title: <3-6 words>`) that {op} can paste after /rename. Neither /clear nor `! \
+     reseed-here` is a tool call, so the way out is not blocked. Do NOT retry this \
+     call, do not route around it with another tool, and do not ask for the override - \
+     only {op} can lift it, by typing 'override reset'.";
+
+/// The deny reason is model-facing; only this banner reaches the operator.
+const HALT_INJECTOR_BANNER_DEFAULT: &str =
+    "reseed-halt: context ~{ctx}k, past the {line}k line, {note}";
+
 fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -77,27 +94,44 @@ pub fn run(p: Payload) -> i32 {
         return 0;
     }
 
-    if !sentinel_armed(&session) {
-        spawn::rearm(&session);
-    }
+    let armed = sentinel_armed(&session) || spawn::rearm(&session);
+    let live = armed && super::injector_live();
 
-    let reason = msg::fill(
-        &msg::text("halt-deny", HALT_DENY_DEFAULT),
-        &[
-            ("ctx", &(ctx / 1000).to_string()),
-            ("line", &(line / 1000).to_string()),
-            ("op", &msg::operator()),
-        ],
-    );
-    println!(
-        "{}",
-        serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        })
-    );
+    let ctx_k = (ctx / 1000).to_string();
+    let line_k = (line / 1000).to_string();
+    let reason = if live {
+        msg::fill(
+            &msg::text("halt-deny-injector", HALT_DENY_INJECTOR_DEFAULT),
+            &[
+                ("ctx", &ctx_k),
+                ("line", &line_k),
+                ("op", &msg::operator()),
+                ("step", &super::injector_step()),
+            ],
+        )
+    } else {
+        msg::fill(
+            &msg::text("halt-deny", HALT_DENY_DEFAULT),
+            &[("ctx", &ctx_k), ("line", &line_k), ("op", &msg::operator())],
+        )
+    };
+    let mut out = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    });
+    if live {
+        out["systemMessage"] = serde_json::Value::String(msg::fill(
+            &msg::text("halt-injector-banner", HALT_INJECTOR_BANNER_DEFAULT),
+            &[
+                ("ctx", &ctx_k),
+                ("line", &line_k),
+                ("note", &super::injector_note()),
+            ],
+        ));
+    }
+    println!("{out}");
     0
 }
