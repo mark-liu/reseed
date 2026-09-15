@@ -15,6 +15,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Gap between the two box reads that bound the type-under-us window.
 const SETTLE: Duration = Duration::from_secs(3);
+/// Between a keystroke and reading its echo back; CC redraws well inside this.
+const ECHO: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 800 });
+const ECHO_READS: usize = 3;
+const DEL: u8 = 0x7f;
 
 /// A stage that never completes is retried once, then parked this long so a
 /// misjudged session is not typed into again and again (spec D6).
@@ -176,7 +180,7 @@ pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
                 );
                 Action::new(&cand.sid, &cand.job, "done", "clear and go both delivered")
             }
-            _ => send_clear(&control, &jobs, &cand, now, opts, &mut state)?,
+            _ => send_clear(&jobs, &cand, now, opts, &mut state)?,
         };
         actions.push(action);
     }
@@ -342,7 +346,6 @@ fn secs(t: SystemTime) -> u64 {
 /// Guards, then one `/clear`. Order is cheapest-first, and every refusal
 /// names the guard so `watch.log` says why a session was left alone.
 fn send_clear(
-    control: &control::Control,
     jobs: &[control::Job],
     cand: &Candidate,
     now: SystemTime,
@@ -368,15 +371,9 @@ fn send_clear(
             "a distill for this session is still running",
         ));
     }
-    if attached_client(&cand.job) {
-        return Ok(Action::new(
-            &cand.sid,
-            &cand.job,
-            "skip",
-            "a client is attached, so someone may be typing",
-        ));
-    }
-    let box_state = prompt_box(&cand.job)?;
+    // No attached-client guard: `/clear` is typed and read back before return,
+    // so a keystroke racing it can only cost the keystroke, never submit a draft.
+    let box_state = prompt_box(&cand.job, screen::Dim::Ignored)?;
     if !box_state.may_type() {
         return Ok(Action::new(
             &cand.sid,
@@ -424,23 +421,44 @@ fn send_clear(
             format!("dry run, {}", box_state.reason()),
         ));
     }
+    let Some(worker) = pty::workers()?.remove(&cand.job) else {
+        return Ok(Action::new(
+            &cand.sid,
+            &cand.job,
+            "skip",
+            "no pty socket for this job",
+        ));
+    };
     let attempts = state
         .sessions
         .get(&cand.sid)
         .map(|e| e.attempts)
         .unwrap_or(0);
-    control.reply(&cand.job, "/clear")?;
+    let echo = type_command(&worker, "/clear", "")?;
+    let exact = echo == screen::Echo::Exact;
+    // A refusal parks the session for the cooldown: a dictation interim reads
+    // empty on every pass, and typing into it each tick is the harm.
     state.sessions.insert(
         cand.sid.clone(),
         Entry {
-            stage: Stage::ClearSent,
+            stage: if exact {
+                Stage::ClearSent
+            } else {
+                Stage::Failed
+            },
             at: secs(now),
-            attempts: attempts + 1,
+            attempts: attempts + u32::from(exact),
             job: cand.job.clone(),
             arm_sid: cand.sid.clone(),
         },
     );
-    Ok(Action::new(&cand.sid, &cand.job, "clear", "typed /clear"))
+    let did = if exact { "clear" } else { "refuse" };
+    Ok(Action::new(
+        &cand.sid,
+        &cand.job,
+        did,
+        echo.reason("/clear"),
+    ))
 }
 
 /// What `after_clear` needs about a session. Held separately from `Candidate`
@@ -475,7 +493,40 @@ fn after_clear(
             if opts.dry_run {
                 return Ok(Action::new(sid, job, "would-go", "dry run"));
             }
-            control.reply(job, &go_text(&landing))?;
+            // A client may be attached to the fresh context, so `go` is typed and
+            // read back like the clear. A draft there means Mark took over.
+            let box_state = prompt_box(job, screen::Dim::Ignored)?;
+            let worker = pty::workers()?.remove(job);
+            let (Some(worker), true) = (worker, box_state.may_type()) else {
+                let why = format!("reload delivered, go held: {}", box_state.reason());
+                if !matches!(box_state, screen::BoxState::Draft { .. }) {
+                    return Ok(Action::new(sid, job, "wait", why));
+                }
+                state.sessions.insert(
+                    sid.to_string(),
+                    Entry {
+                        stage: Stage::Done,
+                        at: secs(now),
+                        ..entry.clone()
+                    },
+                );
+                return Ok(Action::new(sid, job, "refuse", why));
+            };
+            let text = go_text(&landing);
+            let (head, tail) = text.split_at(2);
+            let echo = type_command(&worker, head, tail)?;
+            if echo != screen::Echo::Exact {
+                state.sessions.insert(
+                    sid.to_string(),
+                    Entry {
+                        stage: Stage::Done,
+                        at: secs(now),
+                        ..entry.clone()
+                    },
+                );
+                let why = format!("reload delivered, go left for Mark: {}", echo.reason("go"));
+                return Ok(Action::new(sid, job, "refuse", why));
+            }
             state.sessions.insert(
                 sid.to_string(),
                 Entry {
@@ -592,9 +643,8 @@ fn recover(
             "reload never landed, worker busy; recovering next pass",
         ));
     }
-    // send_clear refuses an attached job because that is the only window in
-    // which the box can change under the two reads; the payload here is 400x
-    // larger, so the guard matters more, not less.
+    // The reload is a multi-line paste plus return, so it cannot be typed and
+    // read back like `/clear`: keep the attached guard and read dim text as typed.
     if attached_client(t.job) {
         return Ok(Action::new(
             t.sid,
@@ -603,7 +653,7 @@ fn recover(
             "reload never landed, a client is attached; recovering next pass",
         ));
     }
-    let box_state = prompt_box(t.job)?;
+    let box_state = prompt_box(t.job, screen::Dim::Typed)?;
     if !box_state.may_type() {
         return Ok(Action::new(
             t.sid,
@@ -778,8 +828,8 @@ fn rearm(sid: &str, pid: Option<u32>, cwd: Option<&str>) -> Result<()> {
     .map(|_| ())
 }
 
-/// Nobody can type into a background session without attaching to it, so an
-/// attached client is the only window in which the box can change under us.
+/// An attached client is the window in which the box can change under a paste.
+/// Leaky: an attach from the agents view runs in-process and spawns no `claude attach`.
 fn attached_client(job: &str) -> bool {
     std::process::Command::new("pgrep")
         .args(["-f", &format!("claude attach {job}")])
@@ -790,21 +840,48 @@ fn attached_client(job: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Type `head` into a box already read as empty and read it back. Only a box
+/// holding exactly `head` gets `tail` and a return, sent apart so the return is
+/// never part of one input chunk; `head` glued to anything is deleted again.
+fn type_command(worker: &pty::Worker, head: &str, tail: &str) -> Result<screen::Echo> {
+    pty::type_input(worker, head.as_bytes())?;
+    let mut echo = screen::Echo::Other("not read".into());
+    for _ in 0..ECHO_READS {
+        std::thread::sleep(ECHO);
+        echo = screen::echo(&pty::read_screen(worker)?, head);
+        if !matches!(echo, screen::Echo::Other(_)) {
+            break;
+        }
+    }
+    match echo {
+        screen::Echo::Exact => {
+            if !tail.is_empty() {
+                pty::type_input(worker, tail.as_bytes())?;
+                std::thread::sleep(ECHO);
+            }
+            pty::type_input(worker, b"\r")?;
+        }
+        screen::Echo::Glued => pty::type_input(worker, &vec![DEL; head.len()])?,
+        screen::Echo::Other(_) => {}
+    }
+    Ok(echo)
+}
+
 /// Read the box twice, a beat apart. One read proves what was there; two
 /// identical reads narrow the window in which a keystroke could land between
 /// the look and the paste.
-fn prompt_box(job: &str) -> Result<screen::BoxState> {
+fn prompt_box(job: &str, dim: screen::Dim) -> Result<screen::BoxState> {
     let Some(worker) = pty::workers()?.remove(job) else {
         return Ok(screen::BoxState::NotRecognised(
             "no pty socket for this job".into(),
         ));
     };
-    let first = screen::classify(&pty::read_screen(&worker)?);
+    let first = screen::classify(&pty::read_screen(&worker)?, dim);
     if !first.may_type() {
         return Ok(first);
     }
     std::thread::sleep(SETTLE);
-    let second = screen::classify(&pty::read_screen(&worker)?);
+    let second = screen::classify(&pty::read_screen(&worker)?, dim);
     if second != first {
         return Ok(screen::BoxState::NotRecognised(
             "the box changed between two reads".into(),
@@ -956,9 +1033,180 @@ mod tests {
     fn probe_a_live_prompt_box() {
         let job = std::env::var("RESEED_PROBE_JOB").expect("set RESEED_PROBE_JOB");
         for one in job.split(',') {
-            let verdict = prompt_box(one).expect("reading the box");
-            println!("{one}: {verdict:?} -> may_type={}", verdict.may_type());
+            for dim in [screen::Dim::Typed, screen::Dim::Ignored] {
+                let verdict = prompt_box(one, dim).expect("reading the box");
+                println!(
+                    "{one} {dim:?}: {verdict:?} -> may_type={}",
+                    verdict.may_type()
+                );
+            }
         }
+    }
+
+    /// Not a unit test: types `RESEED_TYPE_TEXT` (default `/clear`) into a THROWAWAY
+    /// job through the production path. `RESEED_TYPE_JOB=<short> cargo test -- --ignored`
+    #[test]
+    #[ignore]
+    fn probe_type_into_a_live_job() {
+        let job = std::env::var("RESEED_TYPE_JOB").expect("set RESEED_TYPE_JOB");
+        let text = std::env::var("RESEED_TYPE_TEXT").unwrap_or_else(|_| "/clear".into());
+        let worker = pty::workers().unwrap().remove(&job).expect("no worker");
+        let cut = if text.starts_with('/') {
+            text.len()
+        } else {
+            text.len().min(2)
+        };
+        let (head, tail) = text.split_at(cut);
+        let echo = type_command(&worker, head, tail).expect("typing");
+        println!("{job}: {echo:?} -> {}", echo.reason(head));
+    }
+
+    /// A pty host that keeps one prompt box. Keystrokes edit the draft, return
+    /// submits it, and each connection gets the box replayed first. A suggestion
+    /// is painted only while the draft is empty; an interim is always painted.
+    struct FakeBox {
+        worker: pty::Worker,
+        draft: std::sync::Arc<std::sync::Mutex<String>>,
+        submitted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn fake_box(draft: &str, suggestion: &'static str, interim: &'static str) -> FakeBox {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("pty.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let draft = Arc::new(Mutex::new(draft.to_string()));
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let (d, s) = (draft.clone(), submitted.clone());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut head = [0u8; 5];
+                conn.read_exact(&mut head).unwrap();
+                let mut auth =
+                    vec![0u8; u32::from_be_bytes(head[..4].try_into().unwrap()) as usize];
+                conn.read_exact(&mut auth).unwrap();
+                assert_eq!(head[4], 1, "auth first");
+                let text = d.lock().unwrap().clone();
+                let dim = if text.is_empty() { suggestion } else { "" };
+                let screen = format!(
+                    "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K\u{276f}\u{a0}{text}\u{1b}[2m{dim}{interim}\u{1b}[22m\u{1b}[61;{}H",
+                    3 + text.chars().count()
+                );
+                let mut replay = (screen.len() as u32).to_be_bytes().to_vec();
+                replay.push(0);
+                replay.extend_from_slice(screen.as_bytes());
+                conn.write_all(&replay).unwrap();
+                conn.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut rest = Vec::new();
+                conn.read_to_end(&mut rest).unwrap();
+                for (kind, keys) in pty_frames(&rest) {
+                    assert_eq!(kind, 0, "only keystrokes after auth");
+                    for &k in &keys {
+                        let mut text = d.lock().unwrap();
+                        match k {
+                            DEL => {
+                                text.pop();
+                            }
+                            b'\r' => s.lock().unwrap().push(std::mem::take(&mut *text)),
+                            k => text.push(char::from(k)),
+                        }
+                    }
+                }
+            }
+        });
+        FakeBox {
+            worker: pty::Worker {
+                pty_sock: sock,
+                pty_auth: "tok".into(),
+            },
+            draft,
+            submitted,
+            _dir: dir,
+        }
+    }
+
+    fn pty_frames(buf: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 5 <= buf.len() {
+            let n = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
+            out.push((buf[i + 4], buf[i + 5..i + 5 + n].to_vec()));
+            i += 5 + n;
+        }
+        out
+    }
+
+    impl FakeBox {
+        /// The host serves connections in order, so a replay proves the last
+        /// keystroke connection was fully applied.
+        fn settled(&self) {
+            pty::read_screen(&self.worker).unwrap();
+        }
+        fn draft(&self) -> String {
+            self.settled();
+            self.draft.lock().unwrap().clone()
+        }
+        fn submitted(&self) -> Vec<String> {
+            self.settled();
+            self.submitted.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn a_clear_typed_into_an_empty_box_is_returned() {
+        let fake = fake_box("", "", "");
+        assert_eq!(
+            type_command(&fake.worker, "/clear", "").unwrap(),
+            screen::Echo::Exact
+        );
+        assert_eq!(fake.submitted(), ["/clear"]);
+    }
+
+    #[test]
+    fn typing_replaces_a_prompt_suggestion_and_the_clear_goes_through() {
+        let fake = fake_box("", "go, use dev14", "");
+        assert_eq!(
+            type_command(&fake.worker, "/clear", "").unwrap(),
+            screen::Echo::Exact
+        );
+        assert_eq!(fake.submitted(), ["/clear"]);
+    }
+
+    #[test]
+    fn a_dictation_interim_gets_the_clear_deleted_and_nothing_submitted() {
+        let fake = fake_box("", "", "and then ship the fix");
+        assert_eq!(
+            type_command(&fake.worker, "/clear", "").unwrap(),
+            screen::Echo::Glued
+        );
+        assert!(fake.submitted().is_empty());
+        assert_eq!(fake.draft(), "");
+    }
+
+    #[test]
+    fn a_draft_typed_since_the_empty_read_is_restored_exactly() {
+        let fake = fake_box("half typed draft", "", "");
+        assert_eq!(
+            type_command(&fake.worker, "/clear", "").unwrap(),
+            screen::Echo::Glued
+        );
+        assert!(fake.submitted().is_empty());
+        assert_eq!(fake.draft(), "half typed draft");
+    }
+
+    #[test]
+    fn go_and_its_tail_submit_as_one_line() {
+        let fake = fake_box("", "", "");
+        let text = go_text(&watch::Landing::Persisted(None));
+        let (head, tail) = text.split_at(2);
+        assert_eq!(
+            type_command(&fake.worker, head, tail).unwrap(),
+            screen::Echo::Exact
+        );
+        assert_eq!(fake.submitted(), [text]);
     }
 
     #[test]

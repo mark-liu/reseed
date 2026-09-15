@@ -114,9 +114,53 @@ fn fingerprint(typed: &str) -> String {
     digest[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn classify(stream: &[u8]) -> BoxState {
+/// Whether dim cells on the box row count as typed. CC paints two dim things
+/// there: a prompt suggestion, which is not in the box's value, and a voice
+/// dictation interim, which is. Only a read followed by `echo` may ignore them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dim {
+    Typed,
+    Ignored,
+}
+
+/// What typing a command into a box read as empty actually produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Echo {
+    /// The box holds the command and nothing else, caret at its end. Return is safe.
+    Exact,
+    /// The command sits right before the caret with other text on the row: a
+    /// draft or a dim dictation interim. Deleting it restores the row.
+    Glued,
+    /// Anything else. Nothing more may be typed.
+    Other(String),
+}
+
+impl Echo {
+    pub fn reason(&self, typed: &str) -> String {
+        match self {
+            Echo::Exact => format!("typed {typed}, read it back alone in the box, pressed return"),
+            Echo::Glued => {
+                format!("typed {typed}, read it back beside other text; deleted it again")
+            }
+            Echo::Other(why) => {
+                format!("typed {typed}, could not read it back ({why}); left for Mark")
+            }
+        }
+    }
+}
+
+/// The live box row: each cell from `BASE_COL` as (contents, dim), and the caret's
+/// offset into those cells when it sits on the row.
+struct BoxRow {
+    cells: Vec<(String, bool)>,
+    caret: Option<usize>,
+    row: u16,
+    cursor: (u16, u16),
+}
+
+fn box_row(stream: &[u8]) -> Result<BoxRow, String> {
     if stream.is_empty() {
-        return BoxState::NotRecognised("empty screen stream".into());
+        return Err("empty screen stream".into());
     }
     let (rows, cols) = addressed_geometry(stream);
     let mut parser = vt100::Parser::new(rows, cols, 0);
@@ -124,64 +168,116 @@ pub fn classify(stream: &[u8]) -> BoxState {
     let screen = parser.screen();
     let (cy, cx) = screen.cursor_position();
 
-    let row_at = |y: u16| -> String {
-        (0..cols)
-            .map(|c| {
-                screen
-                    .cell(y, c)
-                    .map(|cell| cell.contents())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(" ")
+    let cell_at = |y: u16, c: u16| -> (String, bool) {
+        screen
+            .cell(y, c)
+            .filter(|cell| !cell.contents().is_empty())
+            .map_or((" ".into(), false), |cell| {
+                (cell.contents().to_string(), cell.dim())
             })
-            .collect()
     };
 
     // Scan up for the box rather than reading the caret row alone, so a draft is
     // still counted when the caret sits mid-text. MARKER + NBSP is what makes the
     // scan safe: a picker option ("\u{276f} 1. charts/canton only") and a scrollback
     // echo both use a plain space.
-    let found = (0..rows).rev().find(|&y| {
-        let row = row_at(y);
-        let mut chars = row.chars();
-        chars.next() == Some(MARKER) && chars.next() == Some(NBSP)
-    });
+    let found = (0..rows)
+        .rev()
+        .find(|&y| cell_at(y, 0).0.starts_with(MARKER) && cell_at(y, 1).0.starts_with(NBSP));
     let Some(by) = found else {
-        return BoxState::NotRecognised(format!("no prompt box on screen (cursor row {cy})"));
+        return Err(format!("no prompt box on screen (cursor row {cy})"));
     };
+    Ok(BoxRow {
+        cells: (BASE_COL..cols).map(|c| cell_at(by, c)).collect(),
+        caret: (cy == by && cx >= BASE_COL).then(|| usize::from(cx - BASE_COL)),
+        row: by,
+        cursor: (cy, cx),
+    })
+}
 
-    // Dim cells are the prompt suggestion, a placeholder painted after the parked
-    // caret; the caret check below still refuses dim text the caret has left.
-    let typed: String = (BASE_COL..cols)
-        .map(|c| {
-            screen
-                .cell(by, c)
-                .filter(|cell| !cell.dim())
-                .map(|cell| cell.contents())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(" ")
+fn text_of(cells: &[(String, bool)], dim: Dim) -> String {
+    let text: String = cells
+        .iter()
+        .map(|(s, is_dim)| match (dim, is_dim) {
+            (Dim::Ignored, true) => " ",
+            _ => s.as_str(),
         })
         .collect();
-    let typed = typed.trim_end();
+    text.trim_end().to_string()
+}
+
+pub fn classify(stream: &[u8], dim: Dim) -> BoxState {
+    let row = match box_row(stream) {
+        Ok(row) => row,
+        Err(why) => return BoxState::NotRecognised(why),
+    };
+    let typed = text_of(&row.cells, dim);
     if !typed.is_empty() {
         return BoxState::Draft {
             chars: typed.chars().count(),
-            fp: fingerprint(typed),
+            fp: fingerprint(&typed),
         };
     }
     // An empty box row alone does not prove an empty box: a multi-line draft whose
     // first line is blank paints exactly this, and so does a stale row left below
     // the live area by a terminal resize. The caret parked on it is the proof.
-    if (cy, cx) != (by, BASE_COL) {
+    if row.caret != Some(0) {
+        let (cy, cx) = row.cursor;
         return BoxState::NotRecognised(format!(
-            "caret at row {cy} column {cx}, not parked on box row {by} column {BASE_COL}"
+            "caret at row {cy} column {cx}, not parked on box row {} column {BASE_COL}",
+            row.row
         ));
     }
     BoxState::Empty
 }
 
+/// Read the box after typing `typed` (ASCII) into it. Typing replaces a prompt
+/// suggestion but lands beside a dictation interim, so this read is what tells
+/// the two dim shapes apart. Reasons never quote the row.
+pub fn echo(stream: &[u8], typed: &str) -> Echo {
+    let row = match box_row(stream) {
+        Ok(row) => row,
+        Err(why) => return Echo::Other(why),
+    };
+    let Some(caret) = row.caret.filter(|&c| c <= row.cells.len()) else {
+        let (cy, cx) = row.cursor;
+        return Echo::Other(format!(
+            "caret at row {cy} column {cx}, off box row {}",
+            row.row
+        ));
+    };
+    let n = typed.len();
+    let ours = caret
+        .checked_sub(n)
+        .map(|start| &row.cells[start..caret])
+        .filter(|cells| cells.iter().all(|(_, dim)| !dim))
+        .is_some_and(|cells| text_of(cells, Dim::Typed) == typed);
+    if !ours {
+        return Echo::Other(format!(
+            "the {n} chars before the caret are not what was typed"
+        ));
+    }
+    let rest_blank = row.cells[..caret - n]
+        .iter()
+        .chain(&row.cells[caret..])
+        .all(|(s, _)| s == " ");
+    if rest_blank {
+        Echo::Exact
+    } else {
+        Echo::Glued
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Classify a render with no dim text, which both modes must read alike.
+    fn read(stream: &[u8]) -> BoxState {
+        let strict = classify(stream, Dim::Typed);
+        assert_eq!(strict, classify(stream, Dim::Ignored));
+        strict
+    }
 
     /// One render of the idle prompt box at the bottom of a `rows`-tall screen.
     fn painted(rows: u16, typed: &str) -> Vec<u8> {
@@ -195,12 +291,12 @@ mod tests {
 
     #[test]
     fn empty_box_is_the_only_clearable_state() {
-        assert_eq!(classify(&painted(50, "")), BoxState::Empty);
+        assert_eq!(read(&painted(50, "")), BoxState::Empty);
     }
 
     #[test]
     fn a_draft_is_seen_and_counted_without_being_quoted() {
-        let state = classify(&painted(50, "amend 3315 with the memberships entry"));
+        let state = read(&painted(50, "amend 3315 with the memberships entry"));
         assert!(matches!(state, BoxState::Draft { chars: 37, .. }));
         assert!(!state.reason().contains("memberships"));
         assert!(!state.may_type());
@@ -216,31 +312,113 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_suggestion_is_an_empty_box() {
-        assert_eq!(classify(&suggested("go, use dev14", 3)), BoxState::Empty);
+    fn a_prompt_suggestion_is_an_empty_box_only_when_dim_is_ignored() {
+        let stream = suggested("go, use dev14", 3);
+        assert_eq!(classify(&stream, Dim::Ignored), BoxState::Empty);
+        assert!(matches!(
+            classify(&stream, Dim::Typed),
+            BoxState::Draft { chars: 13, .. }
+        ));
+    }
+
+    #[test]
+    fn a_dictation_interim_paints_exactly_like_a_suggestion() {
+        // Codex's case: an all-interim voice draft is dim with the caret at column 3,
+        // so only the strict read refuses it. A paste must never use the other one.
+        let stream = suggested("and then ship the fix", 3);
+        assert_eq!(classify(&stream, Dim::Ignored), BoxState::Empty);
+        assert!(!classify(&stream, Dim::Typed).may_type());
     }
 
     #[test]
     fn dim_text_the_caret_has_left_is_never_empty() {
+        let stream = suggested("go, use dev14", 16);
         assert!(matches!(
-            classify(&suggested("go, use dev14", 16)),
+            classify(&stream, Dim::Ignored),
             BoxState::NotRecognised(_)
         ));
+        assert!(!classify(&stream, Dim::Typed).may_type());
     }
 
     #[test]
     fn typed_text_before_a_dim_completion_is_still_a_draft() {
         let stream = "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K❯\u{a0}/cl\u{1b}[2mear\u{1b}[22m\u{1b}[61;6H";
         assert!(matches!(
-            classify(stream.as_bytes()),
+            classify(stream.as_bytes(), Dim::Ignored),
             BoxState::Draft { chars: 3, .. }
         ));
+        assert!(matches!(
+            classify(stream.as_bytes(), Dim::Typed),
+            BoxState::Draft { chars: 6, .. }
+        ));
+    }
+
+    /// The box after typing: `typed` normal, then `dim` text, caret parked after `typed`.
+    fn typed_into(typed: &str, dim: &str) -> Vec<u8> {
+        format!(
+            "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K❯\u{a0}{typed}\u{1b}[2m{dim}\u{1b}[22m\u{1b}[61;{}H",
+            3 + typed.chars().count()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_command_alone_in_the_box_is_exact() {
+        assert_eq!(echo(&typed_into("/clear", ""), "/clear"), Echo::Exact);
+        assert_eq!(echo(&typed_into("go", ""), "go"), Echo::Exact);
+    }
+
+    #[test]
+    fn a_command_glued_to_a_draft_is_glued() {
+        assert_eq!(
+            echo(&typed_into("half typed draft/clear", ""), "/clear"),
+            Echo::Glued
+        );
+    }
+
+    #[test]
+    fn a_command_beside_a_dictation_interim_never_reaches_return() {
+        assert_eq!(
+            echo(&typed_into("/clear", "and then ship the fix"), "/clear"),
+            Echo::Glued
+        );
+    }
+
+    #[test]
+    fn a_keystroke_after_the_command_is_not_our_echo() {
+        assert!(matches!(
+            echo(&typed_into("/clearx", ""), "/clear"),
+            Echo::Other(_)
+        ));
+    }
+
+    #[test]
+    fn dim_cells_under_the_caret_are_not_our_echo() {
+        let stream = "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K❯\u{a0}\u{1b}[2m/clear\u{1b}[22m\u{1b}[61;9H";
+        assert!(matches!(echo(stream.as_bytes(), "/clear"), Echo::Other(_)));
+    }
+
+    #[test]
+    fn an_echo_with_the_caret_off_the_box_row_refuses() {
+        assert!(matches!(
+            echo(&parked(64, "/clear"), "/clear"),
+            Echo::Other(_)
+        ));
+        assert!(matches!(echo(b"", "/clear"), Echo::Other(_)));
+    }
+
+    #[test]
+    fn an_echo_refusal_never_quotes_the_row() {
+        let Echo::Other(why) = echo(&typed_into("the secret plan", ""), "/clear") else {
+            panic!("expected a refusal");
+        };
+        assert!(!why.contains("secret"));
     }
 
     #[test]
     fn a_missing_marker_refuses_rather_than_guesses() {
         let stream = b"\x1b[50;1H\x1b[46;1H\x1b[KDo you want to proceed?\x1b[46;1H";
-        assert!(matches!(classify(stream), BoxState::NotRecognised(_)));
+        assert!(matches!(read(stream), BoxState::NotRecognised(_)));
     }
 
     /// The same render, but with the caret left somewhere other than the box row.
@@ -257,16 +435,13 @@ mod tests {
     fn a_blank_box_row_without_the_caret_on_it_is_never_empty() {
         // A draft continued on line two paints the box row blank. Typing there
         // splices `/clear` into that draft and submits it.
-        assert!(matches!(
-            classify(&parked(64, "")),
-            BoxState::NotRecognised(_)
-        ));
+        assert!(matches!(read(&parked(64, "")), BoxState::NotRecognised(_)));
     }
 
     #[test]
     fn the_scan_still_counts_a_draft_the_caret_has_left() {
         assert!(matches!(
-            classify(&parked(64, "open for printing")),
+            read(&parked(64, "open for printing")),
             BoxState::Draft { chars: 17, .. }
         ));
     }
@@ -279,7 +454,7 @@ mod tests {
         let stream = format!(
             "\u{1b}[130;1H\u{1b}[124;1H\u{1b}[K{border}\u{1b}[459G\u{1b}[127;1H\u{1b}[K\u{276f}\u{a0}\u{1b}[127;3H"
         );
-        assert_eq!(classify(stream.as_bytes()), BoxState::Empty);
+        assert_eq!(read(stream.as_bytes()), BoxState::Empty);
     }
 
     #[test]
@@ -289,7 +464,7 @@ mod tests {
         let border = "\u{2500}".repeat(200);
         let stream =
             format!("\u{1b}[50;1H\u{1b}[45;1H{border}\r\n\u{276f}\u{a0}\r\n{border}\u{1b}[46;3H");
-        assert_eq!(classify(stream.as_bytes()), BoxState::Empty);
+        assert_eq!(read(stream.as_bytes()), BoxState::Empty);
     }
 
     #[test]
@@ -299,7 +474,7 @@ mod tests {
         let stream = "\u{1b}[64;1H\u{1b}[46;1H\u{1b}[K\u{276f} 1. charts/canton only\
 \u{1b}[47;1H\u{1b}[K  2. all three canton dirs\u{1b}[63;1H"
             .as_bytes();
-        assert!(matches!(classify(stream), BoxState::NotRecognised(_)));
+        assert!(matches!(read(stream), BoxState::NotRecognised(_)));
     }
 
     #[test]
@@ -307,15 +482,12 @@ mod tests {
         let stream = "\u{1b}[64;1H\u{1b}[43;1H\u{1b}[K\u{276f} open for printing\
 \u{1b}[60;1H\u{1b}[K\u{276f}\u{a0}live draft\u{1b}[63;3H"
             .as_bytes();
-        assert!(matches!(
-            classify(stream),
-            BoxState::Draft { chars: 10, .. }
-        ));
+        assert!(matches!(read(stream), BoxState::Draft { chars: 10, .. }));
     }
 
     #[test]
     fn an_empty_stream_refuses() {
-        assert!(matches!(classify(b""), BoxState::NotRecognised(_)));
+        assert!(matches!(read(b""), BoxState::NotRecognised(_)));
     }
 
     #[test]
@@ -333,9 +505,9 @@ mod tests {
 
     #[test]
     fn a_tall_session_is_read_at_its_own_height() {
-        assert_eq!(classify(&painted(64, "")), BoxState::Empty);
+        assert_eq!(read(&painted(64, "")), BoxState::Empty);
         assert!(matches!(
-            classify(&painted(64, "hi")),
+            read(&painted(64, "hi")),
             BoxState::Draft { chars: 2, .. }
         ));
     }
