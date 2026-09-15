@@ -19,6 +19,7 @@
 const BASE_COL: u16 = 2;
 const MARKER: char = '❯';
 const NBSP: char = '\u{a0}';
+const BORDER: char = '\u{2500}';
 
 /// Replay geometry. Both axes are read off the stream: rendering narrower than
 /// the real terminal makes vt100 wrap the long border rows, which shifts every
@@ -98,7 +99,7 @@ fn addressed_geometry(stream: &[u8]) -> (u16, u16) {
     // A fresh session may address no column past 3; its box borders span the
     // full width, so the longest run of them is the width floor.
     let border = text
-        .split(|c| c != '\u{2500}')
+        .split(|c| c != BORDER)
         .map(|run| run.chars().count())
         .max()
         .unwrap_or(0);
@@ -128,25 +129,20 @@ pub enum Dim {
 pub enum Echo {
     /// The box holds the command and nothing else, caret at its end. Return is safe.
     Exact,
-    /// The command sits right before the caret with other text on the row: a
-    /// draft or a dim dictation interim. Deleting it restores the row.
+    /// The command sits right before the caret with other text on the row or
+    /// under it: a draft or a dim dictation interim. Deleting it restores the box.
     Glued,
     /// Anything else. Nothing more may be typed.
     Other(String),
 }
 
-impl Echo {
-    pub fn reason(&self, typed: &str) -> String {
-        match self {
-            Echo::Exact => format!("typed {typed}, read it back alone in the box, pressed return"),
-            Echo::Glued => {
-                format!("typed {typed}, read it back beside other text; deleted it again")
-            }
-            Echo::Other(why) => {
-                format!("typed {typed}, could not read it back ({why}); left for Mark")
-            }
-        }
-    }
+/// The row right under the box row: a draft's second line, or the bottom border.
+/// Blank when the ring dropped the border; rows further down are the status line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Below {
+    Border,
+    Blank,
+    Text,
 }
 
 /// The live box row: each cell from `BASE_COL` as (contents, dim), and the caret's
@@ -156,6 +152,7 @@ struct BoxRow {
     caret: Option<usize>,
     row: u16,
     cursor: (u16, u16),
+    below: Below,
 }
 
 fn box_row(stream: &[u8]) -> Result<BoxRow, String> {
@@ -187,12 +184,28 @@ fn box_row(stream: &[u8]) -> Result<BoxRow, String> {
     let Some(by) = found else {
         return Err(format!("no prompt box on screen (cursor row {cy})"));
     };
+    let under: String = (0..cols).map(|c| cell_at(by + 1, c).0).collect();
+    let below = if under.trim().is_empty() {
+        Below::Blank
+    } else if under.starts_with(BORDER) {
+        Below::Border
+    } else {
+        Below::Text
+    };
     Ok(BoxRow {
         cells: (BASE_COL..cols).map(|c| cell_at(by, c)).collect(),
         caret: (cy == by && cx >= BASE_COL).then(|| usize::from(cx - BASE_COL)),
         row: by,
         cursor: (cy, cx),
+        below,
     })
+}
+
+/// The box row's undimmed text, to tell a restored draft from a changed one.
+pub fn row_text(stream: &[u8]) -> Option<String> {
+    box_row(stream)
+        .ok()
+        .map(|row| text_of(&row.cells, Dim::Ignored))
 }
 
 fn text_of(cells: &[(String, bool)], dim: Dim) -> String {
@@ -228,6 +241,13 @@ pub fn classify(stream: &[u8], dim: Dim) -> BoxState {
             row.row
         ));
     }
+    // Nor does the caret: arrowing up to a blank first line parks it here while
+    // the draft's text sits below, and `/clear` then runs with that text as args.
+    if row.below == Below::Text {
+        return BoxState::NotRecognised(
+            "text on the row under the box row: a draft's second line or an unknown layout".into(),
+        );
+    }
     BoxState::Empty
 }
 
@@ -261,7 +281,7 @@ pub fn echo(stream: &[u8], typed: &str) -> Echo {
         .iter()
         .chain(&row.cells[caret..])
         .all(|(s, _)| s == " ");
-    if rest_blank {
+    if rest_blank && row.below != Below::Text {
         Echo::Exact
     } else {
         Echo::Glued
@@ -436,6 +456,44 @@ mod tests {
         // A draft continued on line two paints the box row blank. Typing there
         // splices `/clear` into that draft and submits it.
         assert!(matches!(read(&parked(64, "")), BoxState::NotRecognised(_)));
+    }
+
+    /// CC 2.1.272's box with `first` on the marker row, `second` on the row under
+    /// it, then the bottom border, caret parked at the end of `first`.
+    fn two_lines(first: &str, second: &str) -> Vec<u8> {
+        let border = "\u{2500}".repeat(200);
+        format!(
+            "\u{1b}[50;1H\u{1b}[46;1H\u{1b}[K\u{276f}\u{a0}{first}\u{1b}[47;1H  {second}\u{1b}[48;1H{border}\u{1b}[46;{}H",
+            3 + first.chars().count()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn the_border_under_the_box_row_proves_a_one_line_box() {
+        assert_eq!(read(&two_lines("", "")), BoxState::Empty);
+        assert_eq!(echo(&two_lines("/clear", ""), "/clear"), Echo::Exact);
+    }
+
+    #[test]
+    fn a_blank_first_line_with_the_caret_parked_on_it_is_never_empty() {
+        // Live: arrowing up to it and typing ran `/clear` with line two as its args.
+        assert!(matches!(
+            read(&two_lines("", "second line draft")),
+            BoxState::NotRecognised(_)
+        ));
+        assert_eq!(
+            echo(&two_lines("/clear", "second line draft"), "/clear"),
+            Echo::Glued
+        );
+    }
+
+    #[test]
+    fn a_long_session_whose_ring_dropped_the_borders_is_still_empty() {
+        // Masked shape of three idle bender jobs: blank under the box row, then only
+        // the status line's changed fragments two rows down.
+        let stream = "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K\u{276f}\u{a0}\u{1b}[63;33H12\u{1b}[63;54H+40/-2 \u{b7} model:opus-5\u{1b}[61;3H";
+        assert_eq!(read(stream.as_bytes()), BoxState::Empty);
     }
 
     #[test]
