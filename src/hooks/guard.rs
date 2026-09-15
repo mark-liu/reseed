@@ -21,6 +21,13 @@ const GUARD_PAST_LINE_DEFAULT: &str =
      that would have carried it is lost. Re-send the SAME reply with one extra final \
      line, after done:/next:, reading: 'RESET NOW ({ctx}k): {how}'. Do not restate \
      anything else, do not start new work at this context size.";
+
+/// The injector branch: `{state}` says whether the bundle is armed or still
+/// distilling, `{note}` is `hooks::injector_note`.
+const GUARD_ARMED_INJECTOR_DEFAULT: &str =
+    "reseed: context ~{ctx}k, halt at {line}k, {state}: {note}";
+
+const GUARD_INJECTOR_DEFAULT: &str = "reseed: context ~{ctx}k, past the {line}k line, {note}";
 use std::time::{Duration, SystemTime};
 
 const SETTLE_FLOOR: Duration = Duration::from_millis(1500);
@@ -166,9 +173,33 @@ pub fn run(p: Payload) -> i32 {
         if ctx < early {
             return 0;
         }
-        let how = if sentinel_armed(&session) {
+        let armed = sentinel_armed(&session);
+        let spawned = !armed && spawn::rearm(&session);
+        if (armed || spawned) && super::injector_live() {
+            let state = if armed {
+                "bundle armed"
+            } else {
+                "distill running"
+            };
+            println!(
+                "{}",
+                serde_json::json!({
+                    "systemMessage": msg::fill(
+                        &msg::text("guard-armed-injector", GUARD_ARMED_INJECTOR_DEFAULT),
+                        &[
+                            ("ctx", &(ctx / 1000).to_string()),
+                            ("line", &(line / 1000).to_string()),
+                            ("state", state),
+                            ("note", &super::injector_note()),
+                        ],
+                    )
+                })
+            );
+            return 0;
+        }
+        let how = if armed {
             "bundle armed: /clear then 'go'".to_string()
-        } else if spawn::rearm(&session) {
+        } else if spawned {
             "distill running: /clear then 'go' (`! reseed-here` first only if 'go' injects nothing)"
                 .to_string()
         } else {
@@ -203,6 +234,23 @@ pub fn run(p: Payload) -> i32 {
 
     let reply = last_assistant_text(transcript_path);
     write_tier(&state_path, tier);
+    if (armed || spawned) && super::injector_live() {
+        // Nobody has to type the reset, so there is no reminder to force into the reply.
+        println!(
+            "{}",
+            serde_json::json!({
+                "systemMessage": msg::fill(
+                    &msg::text("guard-injector", GUARD_INJECTOR_DEFAULT),
+                    &[
+                        ("ctx", &(ctx / 1000).to_string()),
+                        ("line", &(line / 1000).to_string()),
+                        ("note", &super::injector_note()),
+                    ],
+                )
+            })
+        );
+        return 0;
+    }
     if delivered_re().is_match(&reply) {
         return 0;
     }
