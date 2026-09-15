@@ -184,11 +184,19 @@ fn box_row(stream: &[u8]) -> Result<BoxRow, String> {
     let Some(by) = found else {
         return Err(format!("no prompt box on screen (cursor row {cy})"));
     };
-    let under: String = (0..cols).map(|c| cell_at(by + 1, c).0).collect();
+    let row_at = |y: u16| -> String { (0..cols).map(|c| cell_at(y, c).0).collect() };
+    let is_border = |row: &str| {
+        let run = row.trim_end();
+        !run.is_empty()
+            && run.chars().all(|c| c == BORDER)
+            && run.chars().count() * 2 >= usize::from(cols)
+    };
+    let under = row_at(by + 1);
     let below = if under.trim().is_empty() {
         Below::Blank
-    } else if under.trim_end().chars().all(|c| c == BORDER) {
-        // Whole row: a draft's second line may itself start with a border char.
+    } else if is_border(&under) && !is_border(&row_at(by + 2)) {
+        // The real border spans the box and the status block follows it, never a
+        // second border; a draft line of border chars fails one of the two.
         Below::Border
     } else {
         Below::Text
@@ -476,18 +484,39 @@ mod tests {
         assert_eq!(echo(&two_lines("/clear", ""), "/clear"), Echo::Exact);
     }
 
+    /// `two_lines`, but with line two at column 0 as a live draft can paint it.
+    fn flush_second(first: &str, second: &str) -> Vec<u8> {
+        String::from_utf8(two_lines(first, ""))
+            .unwrap()
+            .replace("\u{1b}[47;1H  ", &format!("\u{1b}[47;1H{second}"))
+            .into_bytes()
+    }
+
     #[test]
-    fn a_second_line_that_starts_with_a_border_char_is_still_a_draft() {
-        let second = "\u{2500}\u{2500} notes";
-        // two_lines indents line two; a live one can sit at column 0.
-        let flush = String::from_utf8(two_lines("", ""))
-            .unwrap()
-            .replace("\u{1b}[47;1H  ", &format!("\u{1b}[47;1H{second}"));
-        assert!(matches!(read(flush.as_bytes()), BoxState::NotRecognised(_)));
-        let typed = String::from_utf8(two_lines("/clear", ""))
-            .unwrap()
-            .replace("\u{1b}[47;1H  ", &format!("\u{1b}[47;1H{second}"));
-        assert_eq!(echo(typed.as_bytes(), "/clear"), Echo::Glued);
+    fn a_second_line_made_of_border_chars_is_still_a_draft() {
+        let full = "\u{2500}".repeat(200);
+        for second in ["\u{2500}\u{2500} notes", "\u{2500}\u{2500}", full.as_str()] {
+            let n = second.chars().count();
+            assert!(
+                matches!(read(&flush_second("", second)), BoxState::NotRecognised(_)),
+                "{n}-char second line read as empty"
+            );
+            assert_eq!(
+                echo(&flush_second("/clear", second), "/clear"),
+                Echo::Glued,
+                "{n}-char second line"
+            );
+        }
+        // Same short line with the ring's border gone: only the width floor sees it.
+        let dropped = |first: &str| {
+            format!(
+                "\u{1b}[50;1H\u{1b}[46;1H\u{1b}[K\u{276f}\u{a0}{first}\u{1b}[47;1H\u{2500}\u{2500}\u{1b}[46;{}H",
+                3 + first.len()
+            )
+            .into_bytes()
+        };
+        assert!(matches!(read(&dropped("")), BoxState::NotRecognised(_)));
+        assert_eq!(echo(&dropped("/clear"), "/clear"), Echo::Glued);
     }
 
     #[test]
@@ -505,7 +534,7 @@ mod tests {
 
     #[test]
     fn a_long_session_whose_ring_dropped_the_borders_is_still_empty() {
-        // Masked shape of three idle bender jobs: blank under the box row, then only
+        // Masked shape of three idle live jobs: blank under the box row, then only
         // the status line's changed fragments two rows down.
         let stream = "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K\u{276f}\u{a0}\u{1b}[63;33H12\u{1b}[63;54H+40/-2 \u{b7} model:opus-5\u{1b}[61;3H";
         assert_eq!(read(stream.as_bytes()), BoxState::Empty);
