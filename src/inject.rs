@@ -371,8 +371,15 @@ fn send_clear(
             "a distill for this session is still running",
         ));
     }
-    // No attached-client guard: `/clear` is typed and read back before return,
-    // so a keystroke racing it can only cost the keystroke, never submit a draft.
+    // Read-back cannot undo a return Mark presses between our keystrokes and the read.
+    if attached_client(&cand.job) {
+        return Ok(Action::new(
+            &cand.sid,
+            &cand.job,
+            "skip",
+            "a client is attached, so someone may be typing",
+        ));
+    }
     let box_state = prompt_box(&cand.job, screen::Dim::Ignored)?;
     if !box_state.may_type() {
         return Ok(Action::new(
@@ -434,8 +441,8 @@ fn send_clear(
         .get(&cand.sid)
         .map(|e| e.attempts)
         .unwrap_or(0);
-    let echo = type_command(&worker, "/clear", "")?;
-    let exact = echo == screen::Echo::Exact;
+    let typed = type_command(&worker, "/clear")?;
+    let exact = typed == Typed::Submitted;
     // A refusal parks the session for the cooldown: a dictation interim reads
     // empty on every pass, and typing into it each tick is the harm.
     state.sessions.insert(
@@ -457,7 +464,7 @@ fn send_clear(
         &cand.sid,
         &cand.job,
         did,
-        echo.reason("/clear"),
+        typed.reason("/clear"),
     ))
 }
 
@@ -493,8 +500,16 @@ fn after_clear(
             if opts.dry_run {
                 return Ok(Action::new(sid, job, "would-go", "dry run"));
             }
-            // A client may be attached to the fresh context, so `go` is typed and
-            // read back like the clear. A draft there means Mark took over.
+            // `go` is typed and read back like the clear, under the same attach
+            // guard. A draft there means Mark took over.
+            if attached_client(job) {
+                return Ok(Action::new(
+                    sid,
+                    job,
+                    "wait",
+                    "reload delivered, go held: a client is attached",
+                ));
+            }
             let box_state = prompt_box(job, screen::Dim::Ignored)?;
             let worker = pty::workers()?.remove(job);
             let (Some(worker), true) = (worker, box_state.may_type()) else {
@@ -512,10 +527,8 @@ fn after_clear(
                 );
                 return Ok(Action::new(sid, job, "refuse", why));
             };
-            let text = go_text(&landing);
-            let (head, tail) = text.split_at(2);
-            let echo = type_command(&worker, head, tail)?;
-            if echo != screen::Echo::Exact {
+            let typed = type_command(&worker, go_text(&landing))?;
+            if typed != Typed::Submitted {
                 state.sessions.insert(
                     sid.to_string(),
                     Entry {
@@ -524,7 +537,7 @@ fn after_clear(
                         ..entry.clone()
                     },
                 );
-                let why = format!("reload delivered, go left for Mark: {}", echo.reason("go"));
+                let why = format!("reload delivered, go left for Mark: {}", typed.reason("go"));
                 return Ok(Action::new(sid, job, "refuse", why));
             }
             state.sessions.insert(
@@ -712,17 +725,13 @@ fn arm_matches(row_arm: &str, arm8: &str) -> bool {
 
 /// The kickoff typed after a proven reload. A persisted reload reached the
 /// context as a preview whose pointer already says how to read the bundle, so
-/// the go defers to it rather than issuing a competing read order.
-fn go_text(landing: &watch::Landing) -> String {
+/// the go defers to it and names no path: the line must fit one box row to be read back.
+fn go_text(landing: &watch::Landing) -> &'static str {
     match landing {
-        watch::Landing::Inline => "go".to_string(),
-        watch::Landing::Persisted(None) => {
+        watch::Landing::Inline => "go",
+        watch::Landing::Persisted(_) => {
             "go: the reload was too large to inline; follow the pointer in its preview above"
-                .to_string()
         }
-        watch::Landing::Persisted(Some(path)) => format!(
-            "go: the reload was too large to inline; follow the pointer in its preview above, and the full hook output is at {path}"
-        ),
     }
 }
 
@@ -840,31 +849,87 @@ fn attached_client(job: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// Type `head` into a box already read as empty and read it back. Only a box
-/// holding exactly `head` gets `tail` and a return, sent apart so the return is
-/// never part of one input chunk; `head` glued to anything is deleted again.
-fn type_command(worker: &pty::Worker, head: &str, tail: &str) -> Result<screen::Echo> {
-    pty::type_input(worker, head.as_bytes())?;
+/// What `type_command` did with the text it typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Typed {
+    /// Read back whole and alone in the box; return pressed.
+    Submitted,
+    /// Not submitted; deleted again and the box row reads as it did before.
+    Removed(String),
+    /// Not submitted, and not provably gone: the box may still hold it.
+    Left(String),
+}
+
+impl Typed {
+    fn reason(&self, label: &str) -> String {
+        match self {
+            Typed::Submitted => {
+                format!("typed {label}, read it back alone in the box, pressed return")
+            }
+            Typed::Removed(why) => format!("typed {label}, {why}; deleted it again"),
+            Typed::Left(why) => format!("typed {label}, {why}; left for Mark"),
+        }
+    }
+}
+
+/// Type `text` into a box already read as empty, read it back whole, and press
+/// return only on an exact echo. Any other outcome deletes it when the read
+/// proves it sits right before the caret, and never submits.
+fn type_command(worker: &pty::Worker, text: &str) -> Result<Typed> {
+    let before = screen::row_text(&pty::read_screen(worker)?);
+    pty::type_input(worker, text.as_bytes())?;
     let mut echo = screen::Echo::Other("not read".into());
     for _ in 0..ECHO_READS {
         std::thread::sleep(ECHO);
-        echo = screen::echo(&pty::read_screen(worker)?, head);
+        echo = read_echo(worker, text);
         if !matches!(echo, screen::Echo::Other(_)) {
             break;
         }
     }
     match echo {
         screen::Echo::Exact => {
-            if !tail.is_empty() {
-                pty::type_input(worker, tail.as_bytes())?;
-                std::thread::sleep(ECHO);
-            }
             pty::type_input(worker, b"\r")?;
+            Ok(Typed::Submitted)
         }
-        screen::Echo::Glued => pty::type_input(worker, &vec![DEL; head.len()])?,
-        screen::Echo::Other(_) => {}
+        screen::Echo::Glued => remove(worker, text, before, "read it back beside other text"),
+        screen::Echo::Other(why) => {
+            // A slow repaint is the usual cause; an echo that shows up late is
+            // still ours to delete, but too late to trust with a return.
+            std::thread::sleep(ECHO * 2);
+            match read_echo(worker, text) {
+                screen::Echo::Other(_) => Ok(Typed::Left(why)),
+                _ => remove(
+                    worker,
+                    text,
+                    before,
+                    &format!("{why}, then it showed up late"),
+                ),
+            }
+        }
     }
-    Ok(echo)
+}
+
+fn read_echo(worker: &pty::Worker, text: &str) -> screen::Echo {
+    match pty::read_screen(worker) {
+        Ok(stream) => screen::echo(&stream, text),
+        Err(e) => screen::Echo::Other(format!("reading the screen failed: {e}")),
+    }
+}
+
+/// Delete `text` from right before the caret and check the row is back.
+fn remove(worker: &pty::Worker, text: &str, before: Option<String>, why: &str) -> Result<Typed> {
+    pty::type_input(worker, &vec![DEL; text.len()])?;
+    std::thread::sleep(ECHO);
+    let after = pty::read_screen(worker)
+        .ok()
+        .and_then(|s| screen::row_text(&s));
+    Ok(if before.is_some() && after == before {
+        Typed::Removed(why.to_string())
+    } else {
+        Typed::Left(format!(
+            "{why}; deleted it, but the box row does not read as before"
+        ))
+    })
 }
 
 /// Read the box twice, a beat apart. One read proves what was there; two
@@ -1051,19 +1116,14 @@ mod tests {
         let job = std::env::var("RESEED_TYPE_JOB").expect("set RESEED_TYPE_JOB");
         let text = std::env::var("RESEED_TYPE_TEXT").unwrap_or_else(|_| "/clear".into());
         let worker = pty::workers().unwrap().remove(&job).expect("no worker");
-        let cut = if text.starts_with('/') {
-            text.len()
-        } else {
-            text.len().min(2)
-        };
-        let (head, tail) = text.split_at(cut);
-        let echo = type_command(&worker, head, tail).expect("typing");
-        println!("{job}: {echo:?} -> {}", echo.reason(head));
+        let typed = type_command(&worker, &text).expect("typing");
+        println!("{job}: {typed:?} -> {}", typed.reason(&text));
     }
 
     /// A pty host that keeps one prompt box. Keystrokes edit the draft, return
     /// submits it, and each connection gets the box replayed first. A suggestion
-    /// is painted only while the draft is empty; an interim is always painted.
+    /// is painted only while the draft is empty; an interim and `under`, a draft's
+    /// second line, are always painted.
     struct FakeBox {
         worker: pty::Worker,
         draft: std::sync::Arc<std::sync::Mutex<String>>,
@@ -1071,7 +1131,12 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    fn fake_box(draft: &str, suggestion: &'static str, interim: &'static str) -> FakeBox {
+    fn fake_box(
+        draft: &str,
+        suggestion: &'static str,
+        interim: &'static str,
+        under: &'static str,
+    ) -> FakeBox {
         use std::io::{Read, Write};
         use std::sync::{Arc, Mutex};
         let dir = tempfile::tempdir().unwrap();
@@ -1092,7 +1157,8 @@ mod tests {
                 let text = d.lock().unwrap().clone();
                 let dim = if text.is_empty() { suggestion } else { "" };
                 let screen = format!(
-                    "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K\u{276f}\u{a0}{text}\u{1b}[2m{dim}{interim}\u{1b}[22m\u{1b}[61;{}H",
+                    "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K\u{276f}\u{a0}{text}\u{1b}[2m{dim}{interim}\u{1b}[22m\u{1b}[62;1H  {under}\u{1b}[63;1H{}\u{1b}[61;{}H",
+                    "\u{2500}".repeat(40),
                     3 + text.chars().count()
                 );
                 let mut replay = (screen.len() as u32).to_be_bytes().to_vec();
@@ -1157,55 +1223,63 @@ mod tests {
 
     #[test]
     fn a_clear_typed_into_an_empty_box_is_returned() {
-        let fake = fake_box("", "", "");
+        let fake = fake_box("", "", "", "");
         assert_eq!(
-            type_command(&fake.worker, "/clear", "").unwrap(),
-            screen::Echo::Exact
+            type_command(&fake.worker, "/clear").unwrap(),
+            Typed::Submitted
         );
         assert_eq!(fake.submitted(), ["/clear"]);
     }
 
     #[test]
     fn typing_replaces_a_prompt_suggestion_and_the_clear_goes_through() {
-        let fake = fake_box("", "go, use dev14", "");
+        let fake = fake_box("", "go, use dev14", "", "");
         assert_eq!(
-            type_command(&fake.worker, "/clear", "").unwrap(),
-            screen::Echo::Exact
+            type_command(&fake.worker, "/clear").unwrap(),
+            Typed::Submitted
         );
         assert_eq!(fake.submitted(), ["/clear"]);
     }
 
     #[test]
     fn a_dictation_interim_gets_the_clear_deleted_and_nothing_submitted() {
-        let fake = fake_box("", "", "and then ship the fix");
-        assert_eq!(
-            type_command(&fake.worker, "/clear", "").unwrap(),
-            screen::Echo::Glued
-        );
+        let fake = fake_box("", "", "and then ship the fix", "");
+        assert!(matches!(
+            type_command(&fake.worker, "/clear").unwrap(),
+            Typed::Removed(_)
+        ));
         assert!(fake.submitted().is_empty());
         assert_eq!(fake.draft(), "");
     }
 
     #[test]
     fn a_draft_typed_since_the_empty_read_is_restored_exactly() {
-        let fake = fake_box("half typed draft", "", "");
-        assert_eq!(
-            type_command(&fake.worker, "/clear", "").unwrap(),
-            screen::Echo::Glued
-        );
+        let fake = fake_box("half typed draft", "", "", "");
+        assert!(matches!(
+            type_command(&fake.worker, "/clear").unwrap(),
+            Typed::Removed(_)
+        ));
         assert!(fake.submitted().is_empty());
         assert_eq!(fake.draft(), "half typed draft");
     }
 
     #[test]
-    fn go_and_its_tail_submit_as_one_line() {
-        let fake = fake_box("", "", "");
+    fn a_clear_on_the_blank_first_line_of_a_draft_is_never_returned() {
+        // Live on CC 2.1.272: this ran `/clear` with the second line as its args.
+        let fake = fake_box("", "", "", "second line draft");
+        assert!(matches!(
+            type_command(&fake.worker, "/clear").unwrap(),
+            Typed::Removed(_)
+        ));
+        assert!(fake.submitted().is_empty());
+        assert_eq!(fake.draft(), "");
+    }
+
+    #[test]
+    fn a_long_go_is_read_back_whole_before_return() {
+        let fake = fake_box("", "", "", "");
         let text = go_text(&watch::Landing::Persisted(None));
-        let (head, tail) = text.split_at(2);
-        assert_eq!(
-            type_command(&fake.worker, head, tail).unwrap(),
-            screen::Echo::Exact
-        );
+        assert_eq!(type_command(&fake.worker, text).unwrap(), Typed::Submitted);
         assert_eq!(fake.submitted(), [text]);
     }
 
@@ -1270,20 +1344,20 @@ mod tests {
     }
 
     #[test]
-    fn a_persisted_reload_earns_a_go_that_names_the_file() {
+    fn a_persisted_reload_earns_a_go_that_fits_one_box_row() {
         assert_eq!(go_text(&watch::Landing::Inline), "go");
         let named = go_text(&watch::Landing::Persisted(Some(
             "/p/tool-results/h.txt".into(),
         )));
-        assert!(named.starts_with("go") && named.ends_with("at /p/tool-results/h.txt"));
         let bare = go_text(&watch::Landing::Persisted(None));
+        assert_eq!(named, bare);
         assert!(bare.starts_with("go") && bare.ends_with("preview above"));
-        for text in [named, bare] {
-            assert!(
-                !text.contains("/clear"),
-                "the concatenation tripwire keys on /clear"
-            );
-        }
+        // A 100-column terminal leaves 98 cells after the marker; a wrapped go is never returned.
+        assert!(bare.len() < 98);
+        assert!(
+            !bare.contains("/clear"),
+            "the concatenation tripwire keys on /clear"
+        );
     }
 
     /// The daemon accepting `/clear` is not the same as the TUI running it,
