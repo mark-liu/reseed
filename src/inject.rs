@@ -1207,7 +1207,7 @@ mod tests {
                 replay.push(0);
                 replay.extend_from_slice(screen.as_bytes());
                 conn.write_all(&replay).unwrap();
-                conn.shutdown(std::net::Shutdown::Write).unwrap();
+                // Stays open like the daemon: the client's drain ends on silence.
                 let mut rest = Vec::new();
                 conn.read_to_end(&mut rest).unwrap();
                 for (kind, keys) in pty_frames(&rest) {
