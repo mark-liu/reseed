@@ -132,23 +132,27 @@ pub fn classify(stream: &[u8]) -> BoxState {
     // still counted when the caret sits mid-text. MARKER + NBSP is what makes the
     // scan safe: a picker option ("\u{276f} 1. charts/canton only") and a scrollback
     // echo both use a plain space.
-    let mut found: Option<(u16, String)> = None;
-    for y in (0..rows).rev() {
+    let found = (0..rows).rev().find(|&y| {
         let row = row_at(y);
         let mut chars = row.chars();
-        if chars.next() == Some(MARKER) && chars.next() == Some(NBSP) {
-            found = Some((y, row));
-            break;
-        }
-    }
-    let (by, row) = match found {
-        Some(v) => v,
-        None => {
-            return BoxState::NotRecognised(format!("no prompt box on screen (cursor row {cy})"))
-        }
+        chars.next() == Some(MARKER) && chars.next() == Some(NBSP)
+    });
+    let Some(by) = found else {
+        return BoxState::NotRecognised(format!("no prompt box on screen (cursor row {cy})"));
     };
 
-    let typed: String = row.chars().skip(BASE_COL as usize).collect();
+    // Dim cells are the prompt suggestion, a placeholder painted after the parked
+    // caret; the caret check below still refuses dim text the caret has left.
+    let typed: String = (BASE_COL..cols)
+        .map(|c| {
+            screen
+                .cell(by, c)
+                .filter(|cell| !cell.dim())
+                .map(|cell| cell.contents())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(" ")
+        })
+        .collect();
     let typed = typed.trim_end();
     if !typed.is_empty() {
         return BoxState::Draft {
@@ -192,6 +196,37 @@ mod tests {
         assert!(matches!(state, BoxState::Draft { chars: 37, .. }));
         assert!(!state.reason().contains("memberships"));
         assert!(!state.may_type());
+    }
+
+    /// The idle box as CC 2.1.271 paints a prompt suggestion, bytes as captured
+    /// live: the marker, the dim placeholder, then the caret parked back at column 3.
+    fn suggested(suggestion: &str, caret_col: u16) -> Vec<u8> {
+        format!(
+            "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K❯\u{a0}\u{1b}[H\r\u{1b}[2C\u{1b}[60B\u{1b}[2m{suggestion}\u{1b}[22m\u{1b}[64;1H\u{1b}[61;{caret_col}H"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_prompt_suggestion_is_an_empty_box() {
+        assert_eq!(classify(&suggested("go, use dev14", 3)), BoxState::Empty);
+    }
+
+    #[test]
+    fn dim_text_the_caret_has_left_is_never_empty() {
+        assert!(matches!(
+            classify(&suggested("go, use dev14", 16)),
+            BoxState::NotRecognised(_)
+        ));
+    }
+
+    #[test]
+    fn typed_text_before_a_dim_completion_is_still_a_draft() {
+        let stream = "\u{1b}[64;1H\u{1b}[61;1H\u{1b}[K❯\u{a0}/cl\u{1b}[2mear\u{1b}[22m\u{1b}[61;6H";
+        assert!(matches!(
+            classify(stream.as_bytes()),
+            BoxState::Draft { chars: 3, .. }
+        ));
     }
 
     #[test]
