@@ -58,8 +58,9 @@ fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
     f
 }
 
-/// Connect, authenticate, and take the replay burst the host sends first.
-fn open(worker: &Worker) -> Result<(UnixStream, Vec<u8>)> {
+/// Connect, authenticate, and take the replay burst the host sends first, with
+/// whether the socket then went quiet rather than still flowing at the deadline.
+fn open(worker: &Worker) -> Result<(UnixStream, Vec<u8>, bool)> {
     let mut sock = UnixStream::connect(&worker.pty_sock)
         .with_context(|| format!("connecting {}", worker.pty_sock.display()))?;
     sock.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -68,8 +69,8 @@ fn open(worker: &Worker) -> Result<(UnixStream, Vec<u8>)> {
     let auth = serde_json::json!({ "t": "auth", "token": worker.pty_auth }).to_string();
     sock.write_all(&frame(KIND_CONTROL, auth.as_bytes()))
         .context("sending the auth frame")?;
-    let replay = drain(&mut sock)?;
-    Ok((sock, replay))
+    let (replay, quiet) = drain(&mut sock)?;
+    Ok((sock, replay, quiet))
 }
 
 /// The rendered screen for one job, as the concatenated output frames.
@@ -80,31 +81,47 @@ pub fn read_screen(worker: &Worker) -> Result<Vec<u8>> {
 /// Type `keys` into the session, exactly as if a human pressed them. Nothing
 /// checks the box first; callers read it before and after.
 pub fn type_input(worker: &Worker, keys: &[u8]) -> Result<()> {
-    let (mut sock, _) = open(worker)?;
+    let (mut sock, _, _) = open(worker)?;
+    send(&mut sock, keys)
+}
+
+/// Type `keys` only if this connection's own replay went quiet and passes `check`,
+/// so the proof and the keystrokes share one socket. Returns whether it typed.
+pub fn type_if(worker: &Worker, keys: &[u8], check: impl FnOnce(&[u8]) -> bool) -> Result<bool> {
+    let (mut sock, replay, quiet) = open(worker)?;
+    // Any repaint reaches this socket, so silence leaves only a keystroke in flight.
+    if !quiet || !check(&output_of(&replay)) {
+        return Ok(false);
+    }
+    send(&mut sock, keys)?;
+    Ok(true)
+}
+
+fn send(sock: &mut UnixStream, keys: &[u8]) -> Result<()> {
     sock.write_all(&frame(KIND_INPUT, keys))
         .context("sending the input frame")?;
     sock.flush().context("flushing the input frame")
 }
 
-fn drain(sock: &mut UnixStream) -> Result<Vec<u8>> {
+fn drain(sock: &mut UnixStream) -> Result<(Vec<u8>, bool)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 65536];
     let deadline = Instant::now() + BURST;
     while Instant::now() < deadline {
         match sock.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => return Ok((buf, true)),
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if buf.len() > MAX_STREAM {
                     bail!("screen replay exceeded {MAX_STREAM} bytes");
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok((buf, true)),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok((buf, true)),
             Err(e) => return Err(e).context("reading the screen replay"),
         }
     }
-    Ok(buf)
+    Ok((buf, false))
 }
 
 /// Concatenate the output frames, dropping the daemon's control chatter.

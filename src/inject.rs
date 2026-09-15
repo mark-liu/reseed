@@ -888,8 +888,17 @@ fn type_command(worker: &pty::Worker, text: &str) -> Result<Typed> {
     }
     match echo {
         screen::Echo::Exact => {
-            pty::type_input(worker, b"\r")?;
-            Ok(Typed::Submitted)
+            let still_exact = |s: &[u8]| screen::echo(s, text) == screen::Echo::Exact;
+            if pty::type_if(worker, b"\r", still_exact)? {
+                Ok(Typed::Submitted)
+            } else {
+                remove(
+                    worker,
+                    text,
+                    before,
+                    "read it back alone, then the box moved before return",
+                )
+            }
         }
         screen::Echo::Glued => remove(worker, text, before, "read it back beside other text"),
         screen::Echo::Other(why) => {
@@ -918,7 +927,25 @@ fn read_echo(worker: &pty::Worker, text: &str) -> screen::Echo {
 
 /// Delete `text` from right before the caret and check the row is back.
 fn remove(worker: &pty::Worker, text: &str, before: Option<String>, why: &str) -> Result<Typed> {
-    pty::type_input(worker, &vec![DEL; text.len()])?;
+    let still_ours = |s: &[u8]| {
+        matches!(
+            screen::echo(s, text),
+            screen::Echo::Exact | screen::Echo::Glued
+        )
+    };
+    let mut deleted = false;
+    for _ in 0..ECHO_READS {
+        if pty::type_if(worker, &vec![DEL; text.len()], still_ours)? {
+            deleted = true;
+            break;
+        }
+        std::thread::sleep(ECHO);
+    }
+    if !deleted {
+        return Ok(Typed::Left(format!(
+            "{why}; the box moved before the delete, so nothing was deleted"
+        )));
+    }
     std::thread::sleep(ECHO);
     let after = pty::read_screen(worker)
         .ok()
@@ -1137,6 +1164,18 @@ mod tests {
         interim: &'static str,
         under: &'static str,
     ) -> FakeBox {
+        racing_box(draft, suggestion, interim, under, None)
+    }
+
+    /// `race` = (n, keys): the user types `keys` just as connection `n` opens,
+    /// after every earlier read and before that connection's replay.
+    fn racing_box(
+        draft: &str,
+        suggestion: &'static str,
+        interim: &'static str,
+        under: &'static str,
+        race: Option<(usize, &'static str)>,
+    ) -> FakeBox {
         use std::io::{Read, Write};
         use std::sync::{Arc, Mutex};
         let dir = tempfile::tempdir().unwrap();
@@ -1146,7 +1185,7 @@ mod tests {
         let submitted = Arc::new(Mutex::new(Vec::new()));
         let (d, s) = (draft.clone(), submitted.clone());
         std::thread::spawn(move || {
-            for conn in listener.incoming() {
+            for (n, conn) in listener.incoming().enumerate() {
                 let Ok(mut conn) = conn else { return };
                 let mut head = [0u8; 5];
                 conn.read_exact(&mut head).unwrap();
@@ -1154,6 +1193,9 @@ mod tests {
                     vec![0u8; u32::from_be_bytes(head[..4].try_into().unwrap()) as usize];
                 conn.read_exact(&mut auth).unwrap();
                 assert_eq!(head[4], 1, "auth first");
+                if let Some((_, keys)) = race.filter(|&(at, _)| at == n) {
+                    d.lock().unwrap().push_str(keys);
+                }
                 let text = d.lock().unwrap().clone();
                 let dim = if text.is_empty() { suggestion } else { "" };
                 let screen = format!(
@@ -1273,6 +1315,30 @@ mod tests {
         ));
         assert!(fake.submitted().is_empty());
         assert_eq!(fake.draft(), "");
+    }
+
+    // Connections in order: 0 the pre-type row, 1 the typing, 2 the read-back,
+    // 3 the return or the first delete.
+    #[test]
+    fn a_keystroke_after_the_read_back_stops_the_return() {
+        let fake = racing_box("", "", "", "", Some((3, "x")));
+        assert!(matches!(
+            type_command(&fake.worker, "/clear").unwrap(),
+            Typed::Left(_)
+        ));
+        assert!(fake.submitted().is_empty());
+        assert_eq!(fake.draft(), "/clearx");
+    }
+
+    #[test]
+    fn a_keystroke_after_the_read_back_stops_the_delete() {
+        let fake = racing_box("half typed draft", "", "", "", Some((3, "!")));
+        assert!(matches!(
+            type_command(&fake.worker, "/clear").unwrap(),
+            Typed::Left(_)
+        ));
+        assert!(fake.submitted().is_empty());
+        assert_eq!(fake.draft(), "half typed draft/clear!");
     }
 
     #[test]
