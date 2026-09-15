@@ -1,10 +1,11 @@
-//! The daemon's per-worker pty socket, read-only.
+//! The daemon's per-worker pty socket.
 //!
 //! One auth frame and the daemon replays that session's rendered screen back.
-//! Nothing is ever written to the session: on a quiet session the replay burst
-//! is followed by no further traffic, so the read leaves no trace. Attaching a
-//! real client is the opposite - it carries a window size and resizes the
-//! session's pty - which is why this speaks the socket directly.
+//! A read writes nothing: on a quiet session the replay burst is followed by no
+//! further traffic, so it leaves no trace. Attaching a real client is the
+//! opposite - it carries a window size and resizes the session's pty - which is
+//! why this speaks the socket directly. `type_input` is the one write: raw
+//! keystrokes, as an attached client sends them.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -16,8 +17,10 @@ use std::time::{Duration, Instant};
 
 /// Frame kinds on the wire. The u32 length prefix counts the payload only and
 /// excludes the kind byte; reading it as inclusive misaligns every frame after
-/// the first and silently yields an empty screen.
+/// the first and silently yields an empty screen. Kind 0 is output from the
+/// host and keystrokes from a client (CC 2.1.271 `Bit`, `IIe=0`).
 const KIND_OUTPUT: u8 = 0;
+const KIND_INPUT: u8 = 0;
 const KIND_CONTROL: u8 = 1;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -47,20 +50,43 @@ pub fn workers() -> Result<HashMap<String, Worker>> {
     Ok(roster.workers)
 }
 
-/// The rendered screen for one job, as the concatenated output frames.
-pub fn read_screen(worker: &Worker) -> Result<Vec<u8>> {
+fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(5 + body.len());
+    f.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    f.push(kind);
+    f.extend_from_slice(body);
+    f
+}
+
+/// Connect, authenticate, and take the replay burst the host sends first.
+fn open(worker: &Worker) -> Result<(UnixStream, Vec<u8>)> {
     let mut sock = UnixStream::connect(&worker.pty_sock)
         .with_context(|| format!("connecting {}", worker.pty_sock.display()))?;
     sock.set_read_timeout(Some(READ_TIMEOUT))?;
     sock.set_write_timeout(Some(READ_TIMEOUT))?;
 
     let auth = serde_json::json!({ "t": "auth", "token": worker.pty_auth }).to_string();
-    let mut frame = Vec::with_capacity(5 + auth.len());
-    frame.extend_from_slice(&(auth.len() as u32).to_be_bytes());
-    frame.push(KIND_CONTROL);
-    frame.extend_from_slice(auth.as_bytes());
-    sock.write_all(&frame).context("sending the auth frame")?;
+    sock.write_all(&frame(KIND_CONTROL, auth.as_bytes()))
+        .context("sending the auth frame")?;
+    let replay = drain(&mut sock)?;
+    Ok((sock, replay))
+}
 
+/// The rendered screen for one job, as the concatenated output frames.
+pub fn read_screen(worker: &Worker) -> Result<Vec<u8>> {
+    Ok(output_of(&open(worker)?.1))
+}
+
+/// Type `keys` into the session, exactly as if a human pressed them. Nothing
+/// checks the box first; callers read it before and after.
+pub fn type_input(worker: &Worker, keys: &[u8]) -> Result<()> {
+    let (mut sock, _) = open(worker)?;
+    sock.write_all(&frame(KIND_INPUT, keys))
+        .context("sending the input frame")?;
+    sock.flush().context("flushing the input frame")
+}
+
+fn drain(sock: &mut UnixStream) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 65536];
     let deadline = Instant::now() + BURST;
@@ -78,7 +104,7 @@ pub fn read_screen(worker: &Worker) -> Result<Vec<u8>> {
             Err(e) => return Err(e).context("reading the screen replay"),
         }
     }
-    Ok(output_of(&buf))
+    Ok(buf)
 }
 
 /// Concatenate the output frames, dropping the daemon's control chatter.
@@ -102,12 +128,36 @@ pub fn output_of(buf: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
 
-    fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
-        let mut f = (body.len() as u32).to_be_bytes().to_vec();
-        f.push(kind);
-        f.extend_from_slice(body);
-        f
+    #[test]
+    fn typing_authenticates_then_sends_one_input_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("pty.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let host = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut wire = Vec::new();
+            let mut head = [0u8; 5];
+            conn.read_exact(&mut head).unwrap();
+            let mut auth = vec![0u8; u32::from_be_bytes(head[..4].try_into().unwrap()) as usize];
+            conn.read_exact(&mut auth).unwrap();
+            wire.extend_from_slice(&head);
+            wire.extend(auth);
+            conn.write_all(&frame(KIND_OUTPUT, b"replay")).unwrap();
+            conn.shutdown(std::net::Shutdown::Write).unwrap();
+            conn.read_to_end(&mut wire).unwrap();
+            wire
+        });
+        let worker = Worker {
+            pty_sock: sock,
+            pty_auth: "tok".into(),
+        };
+        type_input(&worker, b"/clear").unwrap();
+        let wire = host.join().unwrap();
+        let auth = br#"{"t":"auth","token":"tok"}"#;
+        let expected = [frame(KIND_CONTROL, auth), frame(KIND_INPUT, b"/clear")].concat();
+        assert_eq!(wire, expected);
     }
 
     #[test]
