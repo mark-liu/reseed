@@ -187,7 +187,8 @@ fn box_row(stream: &[u8]) -> Result<BoxRow, String> {
     let under: String = (0..cols).map(|c| cell_at(by + 1, c).0).collect();
     let below = if under.trim().is_empty() {
         Below::Blank
-    } else if under.starts_with(BORDER) {
+    } else if under.trim_end().chars().all(|c| c == BORDER) {
+        // Whole row: a draft's second line may itself start with a border char.
         Below::Border
     } else {
         Below::Text
@@ -473,6 +474,20 @@ mod tests {
     fn the_border_under_the_box_row_proves_a_one_line_box() {
         assert_eq!(read(&two_lines("", "")), BoxState::Empty);
         assert_eq!(echo(&two_lines("/clear", ""), "/clear"), Echo::Exact);
+    }
+
+    #[test]
+    fn a_second_line_that_starts_with_a_border_char_is_still_a_draft() {
+        let second = "\u{2500}\u{2500} notes";
+        // two_lines indents line two; a live one can sit at column 0.
+        let flush = String::from_utf8(two_lines("", ""))
+            .unwrap()
+            .replace("\u{1b}[47;1H  ", &format!("\u{1b}[47;1H{second}"));
+        assert!(matches!(read(flush.as_bytes()), BoxState::NotRecognised(_)));
+        let typed = String::from_utf8(two_lines("/clear", ""))
+            .unwrap()
+            .replace("\u{1b}[47;1H  ", &format!("\u{1b}[47;1H{second}"));
+        assert_eq!(echo(typed.as_bytes(), "/clear"), Echo::Glued);
     }
 
     #[test]
