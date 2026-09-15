@@ -30,6 +30,28 @@ const NUDGE_TIER_DEFAULT: &str =
      picker entry is all a future session has to find it by. Then advise {op}: {step} \
      For a new task just /clear. Finish only a near-done step first; do not start new \
      multi-step work at this context size.";
+
+/// The injector branch: `{step}` is `hooks::injector_step`, `{note}` is
+/// `hooks::injector_note`.
+const NUDGE_EARLY_INJECTOR_BANNER_DEFAULT: &str =
+    "reseed-nudge: context ~{ctx}k, {pct}% of {line}k - {note}";
+
+const NUDGE_EARLY_INJECTOR_DEFAULT: &str =
+    "Context is at ~{ctx}k tokens, {pct}% of the {line}k yellow line, and every tool \
+     call is DENIED at {line}k. Reset now, while it is cheap. FIRST invoke the \
+     `rename-thread` skill (after /clear no title can be derived). {step} Report where \
+     the task got to, then end the turn. Finish only a near-done step; do not start new \
+     multi-step work at this size.";
+
+const NUDGE_TIER_INJECTOR_BANNER_DEFAULT: &str = "reseed-nudge: context ~{ctx}k > {line}k - {note}";
+
+const NUDGE_TIER_INJECTOR_DEFAULT: &str =
+    "Context is at ~{ctx}k tokens (yellow line {line}k). This session is past its reset \
+     point - every further turn pays a latency and recall tax. FIRST invoke the \
+     `rename-thread` skill - after /clear the conversation is gone, so this is the LAST \
+     moment a title can be derived from what this session actually did, and the /resume \
+     picker entry is all a future session has to find it by. {step} Finish only a \
+     near-done step, report where the task got to, then end the turn.";
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const REARM_INTERVAL_SECS: f64 = 480.0;
@@ -113,10 +135,43 @@ pub fn run(p: Payload) -> i32 {
         state.early = false;
     }
 
+    // A bundle armed or distilling is what makes the session an injector candidate.
+    let live = ctx >= early
+        && super::injector_live()
+        && (sentinel_armed(&session) || (now - state.armed_at) < REARM_INTERVAL_SECS);
+
     if tier == 0 && ctx >= early && !state.early {
         let ctx_k = ctx / 1000;
         let line_k = lines[0] / 1000;
         let pct = (100.0 * early as f64 / lines[0] as f64).round() as u64;
+        if live {
+            let early_msg = msg::fill(
+                &msg::text("nudge-early-injector", NUDGE_EARLY_INJECTOR_DEFAULT),
+                &[
+                    ("ctx", &ctx_k.to_string()),
+                    ("pct", &pct.to_string()),
+                    ("line", &line_k.to_string()),
+                    ("step", &super::injector_step()),
+                ],
+            );
+            let banner = msg::fill(
+                &msg::text(
+                    "nudge-early-injector-banner",
+                    NUDGE_EARLY_INJECTOR_BANNER_DEFAULT,
+                ),
+                &[
+                    ("ctx", &ctx_k.to_string()),
+                    ("pct", &pct.to_string()),
+                    ("line", &line_k.to_string()),
+                    ("note", &super::injector_note()),
+                ],
+            );
+            emit(&banner, &early_msg);
+            state.tier = tier;
+            state.early = true;
+            write_state(&state_path, &state);
+            return 0;
+        }
         let reset_step = if sentinel_armed(&session) {
             "The reload bundle is ALREADY distilled and armed, so the reset is just \
              /clear then type 'go'."
@@ -164,6 +219,31 @@ pub fn run(p: Payload) -> i32 {
 
     let ctx_k = ctx / 1000;
     let line_k = lines[0] / 1000;
+    if live {
+        let ctx_msg = msg::fill(
+            &msg::text("nudge-tier-injector", NUDGE_TIER_INJECTOR_DEFAULT),
+            &[
+                ("ctx", &ctx_k.to_string()),
+                ("line", &line_k.to_string()),
+                ("step", &super::injector_step()),
+            ],
+        );
+        let banner = msg::fill(
+            &msg::text(
+                "nudge-tier-injector-banner",
+                NUDGE_TIER_INJECTOR_BANNER_DEFAULT,
+            ),
+            &[
+                ("ctx", &ctx_k.to_string()),
+                ("line", &line_k.to_string()),
+                ("note", &super::injector_note()),
+            ],
+        );
+        emit(&banner, &ctx_msg);
+        state.tier = tier;
+        write_state(&state_path, &state);
+        return 0;
+    }
     let reset_step = if sentinel_armed(&session) {
         "The reload bundle is ALREADY distilled and armed, so the reset is just \
          /clear then type 'go' - do NOT run `! reseed-here` first."
@@ -196,6 +276,16 @@ pub fn run(p: Payload) -> i32 {
     state.tier = tier;
     write_state(&state_path, &state);
     0
+}
+
+fn emit(banner: &str, context: &str) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "systemMessage": banner,
+            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context},
+        })
+    );
 }
 
 fn sentinel_armed(session: &str) -> bool {
