@@ -23,7 +23,7 @@ const KIND_OUTPUT: u8 = 0;
 const KIND_INPUT: u8 = 0;
 const KIND_CONTROL: u8 = 1;
 
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+const READ_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 50 } else { 2000 });
 /// The replay arrives in one burst; a busy session's is a few hundred KB.
 const BURST: Duration = Duration::from_secs(5);
 const MAX_STREAM: usize = 8 << 20;
@@ -90,11 +90,37 @@ pub fn type_input(worker: &Worker, keys: &[u8]) -> Result<()> {
 pub fn type_if(worker: &Worker, keys: &[u8], check: impl FnOnce(&[u8]) -> bool) -> Result<bool> {
     let (mut sock, replay, quiet) = open(worker)?;
     // Any repaint reaches this socket, so silence leaves only a keystroke in flight.
-    if !quiet || !check(&output_of(&replay)) {
+    if !quiet || !whole_frames(&replay) || !check(&output_of(&replay)) {
+        return Ok(false);
+    }
+    // Output queued while `check` parsed means the screen moved under the proof.
+    if arrived_since(&mut sock)? {
         return Ok(false);
     }
     send(&mut sock, keys)?;
     Ok(true)
+}
+
+/// Whether `buf` ends on a frame boundary; a cut frame is a repaint not yet seen.
+fn whole_frames(buf: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 5 <= buf.len() {
+        i += 5 + u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+    }
+    i == buf.len()
+}
+
+/// Whether any byte or a hangup reached the socket since the drain. It consumes
+/// what it reads, so only a caller that is about to give up may ask.
+fn arrived_since(sock: &mut UnixStream) -> Result<bool> {
+    sock.set_nonblocking(true)?;
+    let arrived = match sock.read(&mut [0u8; 1]) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(e) => return Err(e).context("checking for output after the proof"),
+    };
+    sock.set_nonblocking(false)?;
+    Ok(arrived)
 }
 
 fn send(sock: &mut UnixStream, keys: &[u8]) -> Result<()> {
@@ -109,7 +135,8 @@ fn drain(sock: &mut UnixStream) -> Result<(Vec<u8>, bool)> {
     let deadline = Instant::now() + BURST;
     while Instant::now() < deadline {
         match sock.read(&mut chunk) {
-            Ok(0) => return Ok((buf, true)),
+            // A hangup proves nothing: no later repaint could reach this socket.
+            Ok(0) => return Ok((buf, false)),
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if buf.len() > MAX_STREAM {
@@ -175,6 +202,78 @@ mod tests {
         let auth = br#"{"t":"auth","token":"tok"}"#;
         let expected = [frame(KIND_CONTROL, auth), frame(KIND_INPUT, b"/clear")].concat();
         assert_eq!(wire, expected);
+    }
+
+    /// One-connection host: records the auth frame, runs `serve`, then records every
+    /// byte the client sends until it hangs up.
+    fn host(
+        serve: impl FnOnce(&mut UnixStream) + Send + 'static,
+    ) -> (Worker, std::thread::JoinHandle<Vec<u8>>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("pty.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut head = [0u8; 5];
+            conn.read_exact(&mut head).unwrap();
+            let mut auth = vec![0u8; u32::from_be_bytes(head[..4].try_into().unwrap()) as usize];
+            conn.read_exact(&mut auth).unwrap();
+            serve(&mut conn);
+            let mut rest = Vec::new();
+            conn.read_to_end(&mut rest).unwrap();
+            rest
+        });
+        let worker = Worker {
+            pty_sock: sock,
+            pty_auth: "tok".into(),
+        };
+        (worker, handle, dir)
+    }
+
+    #[test]
+    fn a_quiet_whole_replay_that_passes_the_check_gets_the_keys() {
+        let (worker, h, _dir) = host(|c| c.write_all(&frame(KIND_OUTPUT, b"box")).unwrap());
+        assert!(type_if(&worker, b"\r", |s| s == b"box").unwrap());
+        assert_eq!(h.join().unwrap(), frame(KIND_INPUT, b"\r"));
+    }
+
+    #[test]
+    fn a_hangup_after_the_replay_gets_no_keys() {
+        let (worker, h, _dir) = host(|c| {
+            c.write_all(&frame(KIND_OUTPUT, b"box")).unwrap();
+            c.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        assert!(!type_if(&worker, b"\r", |_| true).unwrap());
+        assert!(h.join().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_cut_frame_gets_no_keys() {
+        let (worker, h, _dir) = host(|c| {
+            c.write_all(&frame(KIND_OUTPUT, b"box")).unwrap();
+            c.write_all(&[0, 0, 0, 9, KIND_OUTPUT, b'r', b'e']).unwrap();
+        });
+        assert!(!type_if(&worker, b"\r", |_| true).unwrap());
+        assert!(h.join().unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_arriving_while_the_check_runs_gets_no_keys() {
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (done, painted) = std::sync::mpsc::channel::<()>();
+        let (worker, h, _dir) = host(move |c| {
+            c.write_all(&frame(KIND_OUTPUT, b"box")).unwrap();
+            wait.recv().unwrap();
+            c.write_all(&frame(KIND_OUTPUT, b"x")).unwrap();
+            done.send(()).unwrap();
+        });
+        let typed = type_if(&worker, b"\r", |_| {
+            go.send(()).unwrap();
+            painted.recv().unwrap();
+            true
+        });
+        assert!(!typed.unwrap());
+        assert!(h.join().unwrap().is_empty());
     }
 
     #[test]
