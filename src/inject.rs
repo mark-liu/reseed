@@ -32,6 +32,13 @@ const COOLDOWN: Duration = Duration::from_secs(15 * 60);
 /// refused on the daemon's own view rather than on elapsed time.
 const CLEAR_GRACE: Duration = Duration::from_secs(10);
 const MAX_ATTEMPTS: u32 = 2;
+/// Refused on every pass for this long, counted while the Mac was awake,
+/// earns one `stall` row and one `--on-stall` call.
+const STALL_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
+/// A longer gap between passes is sleep or a stopped agent, not waiting.
+const STALL_GAP_CAP: Duration = Duration::from_secs(60);
+/// Newest stall screens kept; each can run to the 8 MiB stream cap.
+const STALL_SCREENS_KEPT: usize = 8;
 
 /// Tiers that mean the hook matched this session by identity and loaded its
 /// bundle. `3-*` is the cwd heuristic, which also logs `arm=` and can inject
@@ -71,10 +78,26 @@ pub struct Entry {
     pub arm_sid: String,
 }
 
+/// How long a candidate has gone uncleared, kept so the notice fires once.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stall {
+    pub since: u64,
+    pub last: u64,
+    pub awake: u64,
+    pub passes: u64,
+    #[serde(default)]
+    pub notified: bool,
+    /// Reason from the last pass that gave one; a cooldown pass gives none.
+    #[serde(default)]
+    pub why: String,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub sessions: BTreeMap<String, Entry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stalls: BTreeMap<String, Stall>,
 }
 
 impl State {
@@ -125,6 +148,8 @@ pub struct InjectOpts {
     pub dry_run: bool,
     /// Scope a proof run to one job; `None` is the production sweep.
     pub only: Option<String>,
+    /// Run once per stalled candidate with its sid8, job and the stall reason.
+    pub on_stall: Option<PathBuf>,
 }
 
 pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
@@ -155,8 +180,9 @@ pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
         let entry = state.sessions.get(&cand.sid).cloned();
         let action = match entry.map(|e| (e.stage, e)) {
             Some((Stage::Done, _)) => continue,
-            Some((Stage::Failed, e)) if !cooled_down(&e, now) => continue,
-            Some((Stage::ClearSent, e)) => after_clear(
+            // No row for a cooldown pass, but it is still uncleared time.
+            Some((Stage::Failed, e)) if !cooled_down(&e, now) => None,
+            Some((Stage::ClearSent, e)) => Some(after_clear(
                 &control,
                 &jobs,
                 &InFlight {
@@ -169,7 +195,7 @@ pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
                 now,
                 opts,
                 &mut state,
-            )?,
+            )?),
             Some((Stage::GoSent, e)) => {
                 state.sessions.insert(
                     cand.sid.clone(),
@@ -178,11 +204,48 @@ pub fn run(opts: &InjectOpts) -> Result<Vec<Action>> {
                         ..e
                     },
                 );
-                Action::new(&cand.sid, &cand.job, "done", "clear and go both delivered")
+                Some(Action::new(
+                    &cand.sid,
+                    &cand.job,
+                    "done",
+                    "clear and go both delivered",
+                ))
             }
-            _ => send_clear(&jobs, &cand, now, opts, &mut state)?,
+            _ => Some(send_clear(&jobs, &cand, now, opts, &mut state)?),
         };
-        actions.push(action);
+        // A dry run saves no state, so it would notify again on every run.
+        let stall = (!opts.dry_run)
+            .then(|| {
+                track_stall(
+                    &mut state.stalls,
+                    action.as_ref(),
+                    &cand.sid,
+                    &cand.job,
+                    secs(now),
+                )
+            })
+            .flatten();
+        actions.extend(action);
+        if let Some(mut stall) = stall {
+            if let Some(shot) = save_stall_screen(&cand, &stall.why) {
+                stall.why = format!("{}; screen saved to {}", stall.why, shot.display());
+            }
+            // Saved before the notifier runs: a pass that errors later must not notify again.
+            state.save(&state_path)?;
+            // Second record in the launchd log, in case the watch.log append fails.
+            eprintln!(
+                "inject: stall {} job={} {}",
+                stall.sid8, stall.job, stall.why
+            );
+            if let Some(cmd) = &opts.on_stall {
+                notify_stall(cmd, &stall);
+            }
+            actions.push(stall);
+        }
+    }
+    // A scoped proof run sees one job; the rest are not gone, only unlisted.
+    if opts.only.is_none() {
+        state.stalls.retain(|sid, _| seen.contains(sid));
     }
     actions.extend(drive_in_flight(
         &control, &jobs, &projects, &seen, now, opts, &mut state,
@@ -333,6 +396,103 @@ fn drive_in_flight(
         });
     }
     Ok(actions)
+}
+
+/// Count a pass that left `sid` uncleared; the pass that crosses
+/// `STALL_AFTER` returns the one `stall` action that session will get.
+/// `outcome` is `None` on a cooldown pass, which logs no row of its own.
+fn track_stall(
+    stalls: &mut BTreeMap<String, Stall>,
+    outcome: Option<&Action>,
+    sid: &str,
+    job: &str,
+    now: u64,
+) -> Option<Action> {
+    if outcome.is_some_and(|a| !matches!(a.did.as_str(), "skip" | "rearm" | "refuse")) {
+        stalls.remove(sid);
+        return None;
+    }
+    let stall = stalls.entry(sid.to_string()).or_insert(Stall {
+        since: now,
+        last: now,
+        why: "cooling down after a failed attempt".into(),
+        ..Stall::default()
+    });
+    stall.awake += now.saturating_sub(stall.last).min(STALL_GAP_CAP.as_secs());
+    stall.last = now;
+    stall.passes += 1;
+    if let Some(action) = outcome {
+        stall.why.clone_from(&action.why);
+    }
+    if stall.notified || stall.awake < STALL_AFTER.as_secs() {
+        return None;
+    }
+    stall.notified = true;
+    Some(Action::new(
+        sid,
+        job,
+        "stall",
+        format!(
+            "uncleared for {}h{:02}m awake over {} passes, last: {}",
+            stall.awake / 3600,
+            stall.awake % 3600 / 60,
+            stall.passes,
+            stall.why
+        ),
+    ))
+}
+
+/// The byte stream behind a box the allow-list keeps refusing, kept as a
+/// fixture. Only for box refusals: those passes already read this screen.
+fn save_stall_screen(cand: &Candidate, why: &str) -> Option<PathBuf> {
+    if !why.contains("prompt box") {
+        return None;
+    }
+    let worker = pty::workers().ok()?.remove(&cand.job)?;
+    let stream = pty::read_screen(&worker).ok()?;
+    let sid8: String = cand.sid.chars().take(8).collect();
+    let dir = paths::reseed_dir().ok()?;
+    let path = dir.join(format!("stall-{sid8}.screen"));
+    crate::atomic::write(&path, &stream).ok()?;
+    prune_stall_screens(&dir, STALL_SCREENS_KEPT);
+    Some(path)
+}
+
+/// Drop the oldest `stall-*.screen` files past `keep`.
+fn prune_stall_screens(dir: &Path, keep: usize) {
+    let mut shots: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("stall-") && n.ends_with(".screen"))
+        })
+        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
+        .collect();
+    shots.sort();
+    let excess = shots.len().saturating_sub(keep);
+    for (_, path) in shots.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Fire and forget: a notifier that hangs or cannot start must not cost the pass.
+fn notify_stall(cmd: &Path, stall: &Action) {
+    use std::os::unix::process::CommandExt;
+    let spawned = std::process::Command::new(cmd)
+        .args([&stall.sid8, &stall.job, &stall.why])
+        // Own group: launchd kills the job's group when a `--once` pass exits.
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Err(e) = spawned {
+        eprintln!("inject: on-stall {} did not start: {e}", cmd.display());
+    }
 }
 
 fn cooled_down(entry: &Entry, now: SystemTime) -> bool {
@@ -1399,6 +1559,7 @@ mod tests {
             &InjectOpts {
                 dry_run: false,
                 only: None,
+                on_stall: None,
             },
             &mut state,
         )
@@ -1450,6 +1611,7 @@ mod tests {
             &InjectOpts {
                 dry_run: false,
                 only: None,
+                on_stall: None,
             },
             &mut state,
         )
@@ -1480,6 +1642,7 @@ mod tests {
             &InjectOpts {
                 dry_run: false,
                 only: None,
+                on_stall: None,
             },
             &mut state,
         )
@@ -1534,6 +1697,151 @@ mod tests {
         assert!(State::load(&dir.path().join("nope.json"))
             .sessions
             .is_empty());
+    }
+
+    fn skip(why: &str) -> Action {
+        Action::new("aaaaaaaa-1111", "jobjob12", "skip", why)
+    }
+
+    #[test]
+    fn two_waking_hours_of_refusals_raise_one_stall() {
+        let mut stalls = BTreeMap::new();
+        let mut now = 1_000_000;
+        let mut raised = Vec::new();
+        for _ in 0..(STALL_AFTER.as_secs() / 5 + 10) {
+            raised.extend(track_stall(
+                &mut stalls,
+                Some(&skip("worker is busy")),
+                "aaaaaaaa-1111",
+                "jobjob12",
+                now,
+            ));
+            now += 5;
+        }
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].did, "stall");
+        assert!(raised[0].why.starts_with("uncleared for 2h00m awake"));
+        assert!(raised[0].why.ends_with("last: worker is busy"));
+        assert!(stalls["aaaaaaaa-1111"].notified);
+    }
+
+    #[test]
+    fn refusals_with_cooldowns_between_them_raise_one_stall() {
+        let mut stalls = BTreeMap::new();
+        let sid = "aaaaaaaa-1111";
+        let refuse = Action::new(sid, "jobjob12", "refuse", "the box moved before return");
+        let per_cooldown = COOLDOWN.as_secs() / 5;
+        let mut raised = Vec::new();
+        for pass in 0..(STALL_AFTER.as_secs() / 5 + 2 * per_cooldown) {
+            // One refused clear, then silent passes until the cooldown expires.
+            let outcome = (pass % per_cooldown == 0).then_some(&refuse);
+            raised.extend(track_stall(
+                &mut stalls,
+                outcome,
+                sid,
+                "jobjob12",
+                1_000_000 + pass * 5,
+            ));
+        }
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].job, "jobjob12");
+        assert!(raised[0].why.starts_with("uncleared for 2h00m awake"));
+        assert!(raised[0].why.ends_with("last: the box moved before return"));
+    }
+
+    #[test]
+    fn a_night_asleep_does_not_count_as_waiting() {
+        let mut stalls = BTreeMap::new();
+        let sid = "aaaaaaaa-1111";
+        let busy = skip("worker is busy");
+        assert!(track_stall(&mut stalls, Some(&busy), sid, "jobjob12", 1_000).is_none());
+        let woke = 1_000 + 8 * 3600;
+        assert!(track_stall(&mut stalls, Some(&busy), sid, "jobjob12", woke).is_none());
+        assert_eq!(stalls[sid].awake, STALL_GAP_CAP.as_secs());
+    }
+
+    #[test]
+    fn a_rearm_keeps_the_clock_and_a_clear_stops_it() {
+        let mut stalls = BTreeMap::new();
+        let sid = "aaaaaaaa-1111";
+        track_stall(
+            &mut stalls,
+            Some(&skip("worker is busy")),
+            sid,
+            "jobjob12",
+            1_000,
+        );
+        let rearm = Action::new(sid, "jobjob12", "rearm", "sentinel is stale, re-armed");
+        track_stall(&mut stalls, Some(&rearm), sid, "jobjob12", 1_005);
+        assert_eq!(stalls[sid].passes, 2);
+        let clear = Action::new(sid, "jobjob12", "clear", "typed /clear");
+        assert!(track_stall(&mut stalls, Some(&clear), sid, "jobjob12", 1_010).is_none());
+        assert!(stalls.is_empty());
+    }
+
+    #[test]
+    fn a_state_file_from_before_stalls_still_loads() {
+        let old =
+            r#"{"sessions":{"s":{"stage":"done","at":1,"attempts":1,"job":"j","arm_sid":"s"}}}"#;
+        let state: State = serde_json::from_str(old).unwrap();
+        assert!(state.stalls.is_empty());
+        assert!(!serde_json::to_string(&state).unwrap().contains("stalls"));
+    }
+
+    #[test]
+    fn only_the_newest_stall_screens_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = SystemTime::now() - Duration::from_secs(1_000);
+        for i in 0..5u64 {
+            let path = dir.path().join(format!("stall-{i:08}.screen"));
+            std::fs::write(&path, b"x").unwrap();
+            std::fs::File::options()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(base + Duration::from_secs(i))
+                .unwrap();
+        }
+        std::fs::write(dir.path().join("watch.log"), b"row").unwrap();
+        prune_stall_screens(dir.path(), 3);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "stall-00000002.screen",
+                "stall-00000003.screen",
+                "stall-00000004.screen",
+                "watch.log"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_notifier_runs_in_its_own_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("on-stall");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nd=$(dirname \"$0\")\nps -o pgid= -p $$ > \"$d/pgid.tmp\" && mv \"$d/pgid.tmp\" \"$d/pgid\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        notify_stall(&hook, &skip("worker is busy"));
+        let pgid = (0..150)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                std::fs::read_to_string(dir.path().join("pgid")).ok()
+            })
+            .expect("the hook never ran");
+        // SAFETY: getpgrp has no preconditions.
+        let ours = unsafe { libc::getpgrp() };
+        assert_ne!(pgid.trim().parse::<i32>().unwrap(), ours);
     }
 
     #[test]

@@ -142,6 +142,11 @@ enum Command {
         /// is left alone, so a proof run cannot reach a live session.
         #[arg(long, value_name = "JOB")]
         only: Option<String>,
+        /// With --inject: run CMD once for a candidate refused on every pass
+        /// for two waking hours, with its sid8, job and the reason as args.
+        /// Default: ~/.claude/reseed/on-stall when that file exists.
+        #[arg(long, value_name = "CMD")]
+        on_stall: Option<PathBuf>,
     },
 }
 
@@ -218,14 +223,26 @@ fn main() -> Result<()> {
             inject,
             dry_run,
             only,
+            on_stall,
         } => watch::run(watch::WatchOpts {
             once,
             since_days: since,
             json,
             log_path: log,
-            inject: inject.then_some(inject::InjectOpts { dry_run, only }),
+            inject: inject.then_some(inject::InjectOpts {
+                dry_run,
+                only,
+                on_stall: on_stall.or_else(default_on_stall),
+            }),
         }),
     }
+}
+
+/// A hook file, not a launchd argument: the previous binary rejects an
+/// unknown flag, and a revert has to stay one `mv`.
+fn default_on_stall() -> Option<PathBuf> {
+    let hook = paths::reseed_dir().ok()?.join("on-stall");
+    hook.is_file().then_some(hook)
 }
 
 /// `reseed ctx`: print a transcript's context tier, or the full snapshot as JSON.
