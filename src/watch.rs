@@ -6,10 +6,11 @@
 use crate::{emit, inject, paths, sentinel, usage};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 pub struct WatchOpts {
     /// Accepted for the future polling mode; this phase always runs once.
@@ -163,9 +164,106 @@ fn print_text(report: &Report) {
     );
 }
 
+/// Past this the log rolls to `watch.log.1`; one old generation is kept.
+const LOG_CAP_BYTES: u64 = 16 * 1024 * 1024;
+/// Emit rows this old are outside every audit window a scheduled pass uses.
+const SEEN_KEEP_DAYS: u64 = 30;
+
+/// Verdict last logged per emission, so a 5s tick does not rewrite the whole
+/// audit window on every pass.
+#[derive(Debug, Default)]
+struct AuditSeen(BTreeMap<String, String>);
+
+impl AuditSeen {
+    fn load(path: &Path) -> Self {
+        let map = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|b| serde_json::from_str(&b).ok())
+            .unwrap_or_default();
+        Self(map)
+    }
+
+    /// True when `row` says something the log does not already hold.
+    fn is_news(&mut self, row: &AuditRow) -> bool {
+        let key = format!("{} {} {}", row.ts, row.sid8, row.tier);
+        let verdict = row.verdict.as_str();
+        if self.0.get(&key).map(String::as_str) == Some(verdict) {
+            return false;
+        }
+        self.0.insert(key, verdict.to_string());
+        true
+    }
+
+    fn save(&mut self, path: &Path, now_secs: u64) -> Result<()> {
+        // Keys open with the emit timestamp, so they sort by age.
+        let cutoff = emit_ts_from_secs(now_secs.saturating_sub(SEEN_KEEP_DAYS * 86_400));
+        self.0.retain(|key, _| key.as_str() >= cutoff.as_str());
+        crate::atomic::write(path, serde_json::to_string(&self.0)?.as_bytes())
+    }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// A pass waits this long for another watch run's log work: 50 x 20ms.
+const LOCK_TRIES: u32 = 50;
+const LOCK_WAIT: Duration = Duration::from_millis(20);
+
+/// Exclusive advisory lock on `<log>.lock`, held until dropped. `None` means
+/// another run kept it the whole wait; that pass appends and rolls nothing.
+fn lock_log(log_path: &Path) -> Option<std::fs::File> {
+    let f = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(with_suffix(log_path, ".lock"))
+        .ok()?;
+    for _ in 0..LOCK_TRIES {
+        if f.try_lock().is_ok() {
+            return Some(f);
+        }
+        std::thread::sleep(LOCK_WAIT);
+    }
+    None
+}
+
+/// Roll the log once it passes `cap`. The live path is replaced by rename and
+/// never removed: hooks stat it as the injector heartbeat.
+fn rotate_if_large(log_path: &Path, cap: u64) -> std::io::Result<bool> {
+    let Ok(meta) = std::fs::metadata(log_path) else {
+        return Ok(false);
+    };
+    if !meta.is_file() || meta.len() < cap {
+        return Ok(false);
+    }
+    let staged = with_suffix(log_path, ".1.tmp");
+    let fresh = with_suffix(log_path, ".new");
+    let _ = std::fs::remove_file(&staged);
+    std::fs::hard_link(log_path, &staged)?;
+    std::fs::rename(&staged, with_suffix(log_path, ".1"))?;
+    std::fs::File::create(&fresh)?;
+    std::fs::rename(&fresh, log_path)?;
+    Ok(true)
+}
+
 fn append_log(log_path: &Path, report: &Report) -> Result<()> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    // Two runs rolling at once would rename the fresh log over the kept generation.
+    let lock = lock_log(log_path);
+    let seen_path = log_path.with_extension("audit-seen.json");
+    let mut seen = AuditSeen::load(&seen_path);
+    if lock.is_some() {
+        match rotate_if_large(log_path, LOG_CAP_BYTES) {
+            // A new generation restates the window, so it reads on its own.
+            Ok(true) => seen = AuditSeen::default(),
+            Ok(false) => {}
+            Err(e) => eprintln!("watch: could not roll {}: {e}", log_path.display()),
+        }
     }
     let mut f = OpenOptions::new()
         .create(true)
@@ -184,7 +282,12 @@ fn append_log(log_path: &Path, report: &Report) -> Result<()> {
             if s.armed { "armed" } else { "unarmed" },
         )?;
     }
+    let mut news = false;
     for a in &report.audit {
+        if !seen.is_news(a) {
+            continue;
+        }
+        news = true;
         writeln!(
             f,
             "{ts}\t{}\t\taudit\tnone\treport\t{}\ttier={}",
@@ -199,6 +302,19 @@ fn append_log(log_path: &Path, report: &Report) -> Result<()> {
             "{ts}\t{}\t\tinject\tjob={}\t{}\t{}",
             a.sid8, a.job, a.did, a.why,
         )?;
+    }
+    // Hooks read this mtime as the injector heartbeat; a quiet pass must still move it.
+    let now = SystemTime::now();
+    let _ = f.set_modified(now);
+    if news && lock.is_some() {
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Unsaved only costs a repeat of these rows on the next pass.
+        if let Err(e) = seen.save(&seen_path, now_secs) {
+            eprintln!("watch: could not save {}: {e}", seen_path.display());
+        }
     }
     Ok(())
 }
@@ -1000,7 +1116,121 @@ mod tests {
         with_home(home, || audit_emit_log(None).unwrap())
     }
 
-    /// The subcommand may only ever create or append `watch.log`.
+    fn report_with(verdict: Verdict) -> Report {
+        Report {
+            sessions: Vec::new(),
+            audit: vec![AuditRow {
+                ts: emit_ts_from_secs(now_secs() as u64),
+                tier: "1b".into(),
+                sid8: "aaaaaaaa".into(),
+                verdict,
+            }],
+            counts: AuditCounts::default(),
+            actions: Vec::new(),
+        }
+    }
+
+    fn audit_lines(log: &Path) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\taudit\t"))
+            .count()
+    }
+
+    #[test]
+    fn an_unchanged_verdict_is_logged_once_and_a_changed_one_again() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("watch.log");
+        append_log(&log, &report_with(Verdict::Missing)).unwrap();
+        append_log(&log, &report_with(Verdict::Missing)).unwrap();
+        assert_eq!(audit_lines(&log), 1);
+        append_log(&log, &report_with(Verdict::Delivered)).unwrap();
+        assert_eq!(audit_lines(&log), 2);
+    }
+
+    #[test]
+    fn a_pass_with_nothing_new_still_moves_the_heartbeat() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("watch.log");
+        append_log(&log, &report_with(Verdict::Delivered)).unwrap();
+        let stale = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        append_log(&log, &report_with(Verdict::Delivered)).unwrap();
+        let age = std::fs::metadata(&log)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap_or_default();
+        assert_eq!(audit_lines(&log), 1);
+        assert!(age < Duration::from_secs(60), "heartbeat is {age:?} old");
+    }
+
+    #[test]
+    fn a_full_log_rolls_and_the_new_one_restates_the_window() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("watch.log");
+        append_log(&log, &report_with(Verdict::Delivered)).unwrap();
+        std::fs::File::options()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .set_len(LOG_CAP_BYTES)
+            .unwrap();
+        append_log(&log, &report_with(Verdict::Delivered)).unwrap();
+        let rolled = tmp.path().join("watch.log.1");
+        assert_eq!(std::fs::metadata(&rolled).unwrap().len(), LOG_CAP_BYTES);
+        assert!(std::fs::metadata(&log).unwrap().len() < 1024);
+        assert_eq!(audit_lines(&log), 1);
+    }
+
+    #[test]
+    fn a_pass_that_cannot_take_the_lock_appends_and_rolls_nothing() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("watch.log");
+        let rolled = tmp.path().join("watch.log.1");
+        append_log(&log, &report_with(Verdict::Delivered)).unwrap();
+        std::fs::File::options()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .set_len(LOG_CAP_BYTES)
+            .unwrap();
+
+        let held = lock_log(&log).unwrap();
+        append_log(&log, &report_with(Verdict::Missing)).unwrap();
+        assert!(!rolled.exists());
+        assert_eq!(audit_lines(&log), 2);
+        drop(held);
+
+        // The sidecar was not saved without the lock, so the next pass rolls and restates.
+        append_log(&log, &report_with(Verdict::Missing)).unwrap();
+        assert!(std::fs::metadata(&rolled).unwrap().len() > LOG_CAP_BYTES);
+        assert_eq!(audit_lines(&log), 1);
+    }
+
+    #[test]
+    fn a_log_under_the_cap_is_left_alone() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("watch.log");
+        std::fs::write(&log, "row\n").unwrap();
+        assert!(!rotate_if_large(&log, 1024).unwrap());
+        assert!(!rotate_if_large(&tmp.path().join("absent.log"), 1).unwrap());
+        assert!(rotate_if_large(&log, 4).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("watch.log.1")).unwrap(),
+            "row\n"
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+    }
+
+    /// The subcommand may only create `watch.log` and the bookkeeping beside it.
     #[test]
     fn run_writes_nothing_outside_watch_log() {
         let tmp = tempdir().unwrap();
@@ -1032,6 +1262,17 @@ mod tests {
                 after.get(path),
                 Some(mtime),
                 "{} was modified by watch",
+                path.display()
+            );
+        }
+        let beside = [
+            home.join(".claude/reseed/watch.audit-seen.json"),
+            home.join(".claude/reseed/watch.log.lock"),
+        ];
+        for path in after.keys() {
+            assert!(
+                before.contains_key(path) || *path == watch_log || beside.contains(path),
+                "{} was created by watch",
                 path.display()
             );
         }
