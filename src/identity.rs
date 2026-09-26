@@ -30,11 +30,18 @@ pub fn registry_pid(sid: &str) -> Option<u32> {
 /// the parent IS the Claude process; a detached `arm` would name the hook
 /// that spawned it, which is why `arm` never falls back to this.
 pub fn parent_pid() -> Option<u32> {
+    ps_field(std::process::id(), "ppid")?.parse().ok()
+}
+
+/// One `ps` column of `pid`, trimmed, with times in UTC as the daemon's roster
+/// records them; `None` only when `ps` could not run.
+pub fn ps_field(pid: u32, field: &str) -> Option<String> {
     let out = std::process::Command::new("ps")
-        .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
+        .env("TZ", "UTC")
+        .args(["-o", &format!("{field}="), "-p", &pid.to_string()])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// A session's pid as seen from a hook: the registry, else this hook's own

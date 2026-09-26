@@ -14,6 +14,12 @@
 //! This is an allow-list. Only the exact idle shape returns `Empty`; a modal,
 //! an unfamiliar layout, a truncated replay and a multi-line draft all fall
 //! through to a verdict that refuses the clear.
+//!
+//! The render needs the terminal's real geometry, which `pty::read_screen` asks
+//! the pty for. Without it the stream's own addressing is the guess, and that is
+//! only a floor on the width: a titled session's top rule is short of the width
+//! by its title, so rendered at the floor it wraps and the box lands a row under
+//! the caret. Live 2026-09-26, that refused `go` for seventy minutes.
 
 /// Where the prompt marker puts the first typed character: `❯`, then U+00A0.
 const BASE_COL: u16 = 2;
@@ -21,9 +27,9 @@ const MARKER: char = '❯';
 const NBSP: char = '\u{a0}';
 const BORDER: char = '\u{2500}';
 
-/// Replay geometry. Both axes are read off the stream: rendering narrower than
-/// the real terminal makes vt100 wrap the long border rows, which shifts every
-/// row drawn relatively below them and destroys the box.
+/// Bounds on the guessed geometry. Rendering narrower than the real terminal
+/// makes vt100 wrap the long border rows, which shifts every row drawn
+/// relatively below them and destroys the box.
 const MIN_COLS: u16 = 120;
 const MAX_COLS: u16 = 1024;
 const MAX_ROWS: u16 = 400;
@@ -58,12 +64,13 @@ impl BoxState {
     }
 }
 
-/// The real terminal's geometry, read off the stream's own cursor addressing.
+/// The fallback geometry, read off the stream's own cursor addressing when the
+/// pty could not say.
 ///
 /// Rows come from `CUP`, and rendering shorter scrolls the box away before we
 /// can read it. Columns come from `CUP`, `CHA` and `CUF` together, because a
 /// session wider than the render wraps its border rows and drags everything
-/// below them out of place.
+/// below them out of place. All of them only bound the width from below.
 fn addressed_geometry(stream: &[u8]) -> (u16, u16) {
     let text = String::from_utf8_lossy(stream);
     let bytes = text.as_bytes();
@@ -145,6 +152,41 @@ enum Below {
     Text,
 }
 
+/// The geometry a screen was rendered at and where it came from; every
+/// refusal's reason ends with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Geometry {
+    rows: u16,
+    cols: u16,
+    from_pty: bool,
+}
+
+impl std::fmt::Display for Geometry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = if self.from_pty {
+            "from the pty"
+        } else {
+            "guessed from the stream"
+        };
+        write!(f, "at {}x{} {source}", self.rows, self.cols)
+    }
+}
+
+/// One rendered cell as (contents, dim); a blank cell reads as a space.
+fn cell(screen: &vt100::Screen, y: u16, c: u16) -> (String, bool) {
+    screen
+        .cell(y, c)
+        .filter(|cell| !cell.contents().is_empty())
+        .map_or((" ".into(), false), |cell| {
+            (cell.contents().to_string(), cell.dim())
+        })
+}
+
+/// Row `y` as text, every cell from column 0 to `cols`.
+fn row(screen: &vt100::Screen, y: u16, cols: u16) -> String {
+    (0..cols).map(|c| cell(screen, y, c).0).collect()
+}
+
 /// The live box row: each cell from `BASE_COL` as (contents, dim), and the caret's
 /// offset into those cells when it sits on the row.
 struct BoxRow {
@@ -153,26 +195,45 @@ struct BoxRow {
     row: u16,
     cursor: (u16, u16),
     below: Below,
+    at: Geometry,
 }
 
-fn box_row(stream: &[u8]) -> Result<BoxRow, String> {
+/// `size` is the pty's own (rows, cols) when the daemon's hello named a REPL
+/// whose tty answered; `None` renders at the guess.
+fn box_row(stream: &[u8], size: Option<(u16, u16)>) -> Result<BoxRow, String> {
     if stream.is_empty() {
         return Err("empty screen stream".into());
     }
-    let (rows, cols) = addressed_geometry(stream);
+    if let Some((rows, cols)) = size {
+        // vt100 allocates rows x cols cells before parsing a byte: a pty claiming
+        // more than any terminal has would ask for gigabytes.
+        if rows == 0 || cols == 0 || rows > MAX_ROWS || cols > MAX_COLS {
+            return Err(format!(
+                "pty size {rows}x{cols} is outside the render bounds, up to {MAX_ROWS}x{MAX_COLS}"
+            ));
+        }
+    }
+    let at = match size {
+        Some((rows, cols)) => Geometry {
+            rows,
+            cols,
+            from_pty: true,
+        },
+        None => {
+            let (rows, cols) = addressed_geometry(stream);
+            Geometry {
+                rows,
+                cols,
+                from_pty: false,
+            }
+        }
+    };
+    let Geometry { rows, cols, .. } = at;
     let mut parser = vt100::Parser::new(rows, cols, 0);
     parser.process(stream);
     let screen = parser.screen();
     let (cy, cx) = screen.cursor_position();
-
-    let cell_at = |y: u16, c: u16| -> (String, bool) {
-        screen
-            .cell(y, c)
-            .filter(|cell| !cell.contents().is_empty())
-            .map_or((" ".into(), false), |cell| {
-                (cell.contents().to_string(), cell.dim())
-            })
-    };
+    let cell_at = |y: u16, c: u16| cell(screen, y, c);
 
     // Scan up for the box rather than reading the caret row alone, so a draft is
     // still counted when the caret sits mid-text. MARKER + NBSP is what makes the
@@ -182,9 +243,9 @@ fn box_row(stream: &[u8]) -> Result<BoxRow, String> {
         .rev()
         .find(|&y| cell_at(y, 0).0.starts_with(MARKER) && cell_at(y, 1).0.starts_with(NBSP));
     let Some(by) = found else {
-        return Err(format!("no prompt box on screen (cursor row {cy})"));
+        return Err(format!("no prompt box on screen (cursor row {cy}) {at}"));
     };
-    let row_at = |y: u16| -> String { (0..cols).map(|c| cell_at(y, c).0).collect() };
+    let row_at = |y: u16| row(screen, y, cols);
     let is_border = |row: &str| {
         let run = row.trim_end();
         !run.is_empty()
@@ -207,12 +268,13 @@ fn box_row(stream: &[u8]) -> Result<BoxRow, String> {
         row: by,
         cursor: (cy, cx),
         below,
+        at,
     })
 }
 
 /// The box row's undimmed text, to tell a restored draft from a changed one.
-pub fn row_text(stream: &[u8]) -> Option<String> {
-    box_row(stream)
+pub fn row_text(stream: &[u8], size: Option<(u16, u16)>) -> Option<String> {
+    box_row(stream, size)
         .ok()
         .map(|row| text_of(&row.cells, Dim::Ignored))
 }
@@ -228,8 +290,8 @@ fn text_of(cells: &[(String, bool)], dim: Dim) -> String {
     text.trim_end().to_string()
 }
 
-pub fn classify(stream: &[u8], dim: Dim) -> BoxState {
-    let row = match box_row(stream) {
+pub fn classify(stream: &[u8], size: Option<(u16, u16)>, dim: Dim) -> BoxState {
+    let row = match box_row(stream, size) {
         Ok(row) => row,
         Err(why) => return BoxState::NotRecognised(why),
     };
@@ -246,16 +308,17 @@ pub fn classify(stream: &[u8], dim: Dim) -> BoxState {
     if row.caret != Some(0) {
         let (cy, cx) = row.cursor;
         return BoxState::NotRecognised(format!(
-            "caret at row {cy} column {cx}, not parked on box row {} column {BASE_COL}",
-            row.row
+            "caret at row {cy} column {cx}, not parked on box row {} column {BASE_COL} {}",
+            row.row, row.at
         ));
     }
     // Nor does the caret: arrowing up to a blank first line parks it here while
     // the draft's text sits below, and `/clear` then runs with that text as args.
     if row.below == Below::Text {
-        return BoxState::NotRecognised(
-            "text on the row under the box row: a draft's second line or an unknown layout".into(),
-        );
+        return BoxState::NotRecognised(format!(
+            "text on the row under the box row: a draft's second line or an unknown layout {}",
+            row.at
+        ));
     }
     BoxState::Empty
 }
@@ -263,16 +326,16 @@ pub fn classify(stream: &[u8], dim: Dim) -> BoxState {
 /// Read the box after typing `typed` (ASCII) into it. Typing replaces a prompt
 /// suggestion but lands beside a dictation interim, so this read is what tells
 /// the two dim shapes apart. Reasons never quote the row.
-pub fn echo(stream: &[u8], typed: &str) -> Echo {
-    let row = match box_row(stream) {
+pub fn echo(stream: &[u8], size: Option<(u16, u16)>, typed: &str) -> Echo {
+    let row = match box_row(stream, size) {
         Ok(row) => row,
         Err(why) => return Echo::Other(why),
     };
     let Some(caret) = row.caret.filter(|&c| c <= row.cells.len()) else {
         let (cy, cx) = row.cursor;
         return Echo::Other(format!(
-            "caret at row {cy} column {cx}, off box row {}",
-            row.row
+            "caret at row {cy} column {cx}, off box row {} {}",
+            row.row, row.at
         ));
     };
     let n = typed.len();
@@ -300,6 +363,15 @@ pub fn echo(stream: &[u8], typed: &str) -> Echo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every fixture below was drawn for the guess, so these read without a size.
+    fn classify(stream: &[u8], dim: Dim) -> BoxState {
+        super::classify(stream, None, dim)
+    }
+
+    fn echo(stream: &[u8], typed: &str) -> Echo {
+        super::echo(stream, None, typed)
+    }
 
     /// Classify a render with no dim text, which both modes must read alike.
     fn read(stream: &[u8]) -> BoxState {
@@ -612,5 +684,120 @@ mod tests {
             read(&painted(64, "hi")),
             BoxState::Draft { chars: 2, .. }
         ));
+    }
+
+    /// CC 2.1.283 right after `/clear` on a titled 63x238 job, as its Ink frame
+    /// paints it: rows drawn relative to home, the top rule short of the width by
+    /// the title, no full-width row and no wide addressing, the caret parked last.
+    fn titled_after_clear(title: &str, cols: usize) -> Vec<u8> {
+        let dashes = "\u{2500}".repeat(cols - title.chars().count() - 3);
+        let rule = format!("{dashes} {title} \u{2500}");
+        assert_eq!(rule.chars().count(), cols);
+        format!(
+            "\u{1b}[H\r\u{1b}[58B{rule}\r\u{1b}[1B\u{276f}\u{a0}\r\u{1b}[1B\u{1b}[K\r\u{1b}[1B  \
+             Fable 5.1 \u{b7} style:concise-mark\u{1b}[63;1H\u{1b}[60;3H"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_titled_top_rule_wraps_at_the_guess_and_fits_at_the_ptys_width() {
+        // Live 2026-09-26: this exact reason held `go` for seventy minutes.
+        let stream = titled_after_clear("japan trip options english booking availability", 238);
+        let BoxState::NotRecognised(why) = classify(&stream, Dim::Typed) else {
+            panic!("the guess must refuse this frame");
+        };
+        assert!(
+            why.starts_with("caret at row 59 column 2, not parked on box row 60 column 2"),
+            "{why}"
+        );
+        assert!(why.ends_with("at 63x196 guessed from the stream"), "{why}");
+        let size = Some((63, 238));
+        assert_eq!(super::classify(&stream, size, Dim::Typed), BoxState::Empty);
+        assert_eq!(
+            super::classify(&stream, size, Dim::Ignored),
+            BoxState::Empty
+        );
+    }
+
+    #[test]
+    fn a_short_bottom_border_is_a_border_at_the_ptys_width() {
+        // Live 2026-09-21 (stall-32aaf9bf): a 69-column job whose ring still held
+        // a `[134C` from a wider frame, so the guess ran 142 wide and the 52-char
+        // bottom border failed its half-width test for two hours.
+        let stream = format!(
+            "\u{1b}[134C\u{1b}[130;1H\u{1b}[127;1H\u{1b}[K\u{276f}\u{a0}\u{1b}[128;1H\u{1b}[K{}\u{1b}[127;3H",
+            "\u{2500}".repeat(52)
+        );
+        let BoxState::NotRecognised(why) = classify(stream.as_bytes(), Dim::Typed) else {
+            panic!("the guess must refuse this frame");
+        };
+        assert!(
+            why.starts_with("text on the row under the box row"),
+            "{why}"
+        );
+        assert!(why.ends_with("at 130x142 guessed from the stream"), "{why}");
+        let size = Some((130, 69));
+        assert_eq!(
+            super::classify(stream.as_bytes(), size, Dim::Typed),
+            BoxState::Empty
+        );
+        assert_eq!(super::echo(stream.as_bytes(), size, ""), Echo::Exact);
+    }
+
+    #[test]
+    fn a_pty_size_outside_the_render_bounds_is_refused_before_rendering() {
+        let stream = titled_after_clear("t", 238);
+        for size in [(u16::MAX, u16::MAX), (0, 238), (63, 0), (MAX_ROWS + 1, 238)] {
+            let BoxState::NotRecognised(why) = super::classify(&stream, Some(size), Dim::Typed)
+            else {
+                panic!("{size:?} must be refused");
+            };
+            assert!(why.starts_with("pty size"), "{why}");
+            assert!(why.contains("outside the render bounds"), "{why}");
+        }
+        assert_eq!(
+            super::classify(&stream, Some((63, 238)), Dim::Typed),
+            BoxState::Empty
+        );
+    }
+
+    /// Not a unit test: renders `RESEED_SCREEN` (a saved replay) at the guessed
+    /// geometry and at `RESEED_RENDER_GEOMETRY=rows,cols`, printing the bottom rows.
+    /// `RESEED_SCREEN=<file> cargo test probe_render_a_saved_screen -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_render_a_saved_screen() {
+        let path = std::env::var("RESEED_SCREEN").expect("set RESEED_SCREEN");
+        let stream = std::fs::read(&path).expect("reading the screen file");
+        let guessed = addressed_geometry(&stream);
+        let forced = std::env::var("RESEED_RENDER_GEOMETRY").ok().and_then(|g| {
+            let (r, c) = g.split_once(',')?;
+            Some((r.parse().ok()?, c.parse().ok()?))
+        });
+        println!("classify(Typed) = {:?}", classify(&stream, Dim::Typed));
+        for (label, (rows, cols)) in
+            std::iter::once(("guessed", guessed)).chain(forced.map(|g| ("forced", g)))
+        {
+            let mut parser = vt100::Parser::new(rows, cols, 0);
+            parser.process(&stream);
+            let screen = parser.screen();
+            let (cy, cx) = screen.cursor_position();
+            let row_at = |y: u16| row(screen, y, cols).trim_end().to_string();
+            let markers: Vec<u16> = (0..rows)
+                .filter(|&y| row_at(y).starts_with(MARKER))
+                .collect();
+            println!(
+                "== {label} rows={rows} cols={cols} cursor=({cy},{cx}) marker rows={markers:?}"
+            );
+            for y in rows.saturating_sub(9)..rows {
+                let row = row_at(y);
+                let shown: String = row.chars().take(120).collect();
+                println!(
+                    "{y:3}|{shown}{}",
+                    if row.chars().count() > 120 { "..." } else { "" }
+                );
+            }
+        }
     }
 }
