@@ -449,7 +449,7 @@ fn save_stall_screen(cand: &Candidate, why: &str) -> Option<PathBuf> {
         return None;
     }
     let worker = pty::workers().ok()?.remove(&cand.job)?;
-    let stream = pty::read_screen(&worker).ok()?;
+    let stream = pty::read_screen(&worker).ok()?.stream;
     let sid8: String = cand.sid.chars().take(8).collect();
     let dir = paths::reseed_dir().ok()?;
     let path = dir.join(format!("stall-{sid8}.screen"));
@@ -1036,7 +1036,8 @@ impl Typed {
 /// return only on an exact echo. Any other outcome deletes it when the read
 /// proves it sits right before the caret, and never submits.
 fn type_command(worker: &pty::Worker, text: &str) -> Result<Typed> {
-    let before = screen::row_text(&pty::read_screen(worker)?);
+    let seen = pty::read_screen(worker)?;
+    let before = screen::row_text(&seen.stream, seen.size);
     pty::type_input(worker, text.as_bytes())?;
     let mut echo = screen::Echo::Other("not read".into());
     for _ in 0..ECHO_READS {
@@ -1048,7 +1049,8 @@ fn type_command(worker: &pty::Worker, text: &str) -> Result<Typed> {
     }
     match echo {
         screen::Echo::Exact => {
-            let still_exact = |s: &[u8]| screen::echo(s, text) == screen::Echo::Exact;
+            let still_exact =
+                |r: &pty::Replay| screen::echo(&r.stream, r.size, text) == screen::Echo::Exact;
             if pty::type_if(worker, b"\r", still_exact)? {
                 Ok(Typed::Submitted)
             } else {
@@ -1080,16 +1082,16 @@ fn type_command(worker: &pty::Worker, text: &str) -> Result<Typed> {
 
 fn read_echo(worker: &pty::Worker, text: &str) -> screen::Echo {
     match pty::read_screen(worker) {
-        Ok(stream) => screen::echo(&stream, text),
+        Ok(r) => screen::echo(&r.stream, r.size, text),
         Err(e) => screen::Echo::Other(format!("reading the screen failed: {e}")),
     }
 }
 
 /// Delete `text` from right before the caret and check the row is back.
 fn remove(worker: &pty::Worker, text: &str, before: Option<String>, why: &str) -> Result<Typed> {
-    let still_ours = |s: &[u8]| {
+    let still_ours = |r: &pty::Replay| {
         matches!(
-            screen::echo(s, text),
+            screen::echo(&r.stream, r.size, text),
             screen::Echo::Exact | screen::Echo::Glued
         )
     };
@@ -1109,7 +1111,7 @@ fn remove(worker: &pty::Worker, text: &str, before: Option<String>, why: &str) -
     std::thread::sleep(ECHO);
     let after = pty::read_screen(worker)
         .ok()
-        .and_then(|s| screen::row_text(&s));
+        .and_then(|r| screen::row_text(&r.stream, r.size));
     Ok(if before.is_some() && after == before {
         Typed::Removed(why.to_string())
     } else {
@@ -1128,15 +1130,19 @@ fn prompt_box(job: &str, dim: screen::Dim) -> Result<screen::BoxState> {
             "no pty socket for this job".into(),
         ));
     };
-    let first = screen::classify(&pty::read_screen(&worker)?, dim);
+    let read = || -> Result<(screen::BoxState, Option<(u16, u16)>)> {
+        let r = pty::read_screen(&worker)?;
+        Ok((screen::classify(&r.stream, r.size, dim), r.size))
+    };
+    let (first, at) = read()?;
     if !first.may_type() {
         return Ok(first);
     }
     std::thread::sleep(SETTLE);
-    let second = screen::classify(&pty::read_screen(&worker)?, dim);
-    if second != first {
+    let (second, still_at) = read()?;
+    if second != first || still_at != at {
         return Ok(screen::BoxState::NotRecognised(
-            "the box changed between two reads".into(),
+            "the box or the pty changed between two reads".into(),
         ));
     }
     Ok(second)
@@ -1285,6 +1291,13 @@ mod tests {
     fn probe_a_live_prompt_box() {
         let job = std::env::var("RESEED_PROBE_JOB").expect("set RESEED_PROBE_JOB");
         for one in job.split(',') {
+            let worker = pty::workers().unwrap().remove(one).expect("no worker");
+            let seen = pty::read_screen(&worker).expect("reading the screen");
+            println!(
+                "{one}: {} bytes, pty size {:?}",
+                seen.stream.len(),
+                seen.size
+            );
             for dim in [screen::Dim::Typed, screen::Dim::Ignored] {
                 let verdict = prompt_box(one, dim).expect("reading the box");
                 println!(
@@ -1389,6 +1402,8 @@ mod tests {
             worker: pty::Worker {
                 pty_sock: sock,
                 pty_auth: "tok".into(),
+                repl_pid: None,
+                repl_proc_start: None,
             },
             draft,
             submitted,
