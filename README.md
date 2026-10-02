@@ -93,6 +93,22 @@ the only accurate path (`tiktoken` is wrong for Claude).
 cargo install --path .
 ```
 
+## Claude Code plugin: reseed-compact
+
+`plugin/` is a Claude Code mod (in-process plugin hook, Claude Code 2.1.287+) that
+replaces a manual `/compact` with a reseed distill: the transcript becomes one message
+holding the narrative and the files the session touched. Auto-compaction, subagent
+compaction and any distill failure (no binary, non-zero exit, stale or oversized
+narrative) fall back to the built-in summarizer.
+
+```sh
+claude plugin marketplace add mark-liu/reseed
+claude plugin install reseed-compact@reseed
+```
+
+It runs `~/.local/bin/reseed-rust`, else `~/.cargo/bin/reseed`, so `cargo install`
+first. Restart open sessions to load it.
+
 ## License
 
 MIT

@@ -1,0 +1,10 @@
+{
+  "name": "reseed-compact",
+  "version": "0.1.0",
+  "description": "Replace manual /compact with a reseed distill bundle; falls back to core on any failure",
+  "author": {
+    "name": "Mark Liu"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/mark-liu/reseed"
+}

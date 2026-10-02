@@ -1,3 +1,6 @@
 /target
 .claude/
 *.tmp
+# Engine-generated per load
+plugin/.claude-plugin/types/
+node_modules/

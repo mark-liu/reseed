@@ -1,0 +1,16 @@
+{
+  "name": "reseed",
+  "owner": {
+    "name": "mark-liu"
+  },
+  "plugins": [
+    {
+      "name": "reseed-compact",
+      "source": "./plugin",
+      "description": "Replace manual /compact with a reseed distill bundle"
+    }
+  ],
+  "metadata": {
+    "description": "Claude Code plugin for reseed: distill-based compaction"
+  }
+}
