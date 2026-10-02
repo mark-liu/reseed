@@ -41,6 +41,8 @@ const STDOUT_DROP_BYTES: usize = 400;
 /// one).
 const BLOCK_OPEN_MARKERS: &[&str] = &[
     "This session is being continued from a previous conversation",
+    // reseed-compact mod (claude-memory/mods): its summary replaces core's on manual /compact.
+    "[reseed-compact]",
     "# Context Usage",
     "## Context Usage",
     "### Context Usage",
@@ -516,6 +518,24 @@ mod tests {
         assert!(b.narrative.contains("now the real ask"));
         assert!(!b.narrative.contains("This session is being continued"));
         assert!(b.harness_stripped_tokens > 0);
+    }
+
+    #[test]
+    fn distill_drops_reseed_compact_summary() {
+        let items = vec![
+            Item::Text {
+                role: "user".into(),
+                text: "[reseed-compact] This conversation was compacted by `reseed distill s`.\n## Narrative\nold"
+                    .into(),
+            },
+            Item::Text {
+                role: "user".into(),
+                text: "next ask".into(),
+            },
+        ];
+        let b = distill(&items, "s");
+        assert!(b.narrative.contains("next ask"));
+        assert!(!b.narrative.contains("[reseed-compact]"));
     }
 
     #[test]
