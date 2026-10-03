@@ -5,6 +5,7 @@
 //! must agree on the shared case table.
 
 use regex::Regex;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 fn ledger_ref() -> &'static Regex {
@@ -240,8 +241,44 @@ fn command(words: &[String]) -> (String, Vec<String>) {
 
 struct Ctx {
     in_dir: bool,
-    assigned: bool,
+    assigned: HashSet<String>, // names set by VAR=... in this call
+    tainted: HashSet<String>,  // the subset whose value references the ledger
     cwd: String,
+}
+
+/// `parked` as a whole path component: ~/scratch/parked-audit-x is not the ledger dir.
+fn parked_component() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?:^|/)parked(?:/|$|[^\w.\-])").unwrap())
+}
+
+fn assign_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?:^|[;&|(\n`])[ \t]*(?:(?:export|local|declare|typeset|readonly)[ \t]+(?:-\w+[ \t]+)?)?([A-Za-z_]\w*)=((?:\$\([^)]*\)|`[^`]*`|"[^"]*"|'[^']*'|[^;\n&|])*)"#,
+        )
+        .unwrap()
+    })
+}
+
+fn var_use() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\$\{?([A-Za-z_]\w*)").unwrap())
+}
+
+/// (assigned names, names whose value references the ledger) for VAR=... in a call.
+fn assignments(cmd: &str) -> (HashSet<String>, HashSet<String>) {
+    let mut assigned = HashSet::new();
+    let mut tainted = HashSet::new();
+    for m in assign_re().captures_iter(cmd) {
+        let name = m[1].to_string();
+        if parked_component().is_match(&m[2]) {
+            tainted.insert(name.clone());
+        }
+        assigned.insert(name);
+    }
+    (assigned, tainted)
 }
 
 fn home() -> String {
@@ -331,7 +368,12 @@ fn hit(arg: &str, ctx: &Ctx, dest: bool) -> bool {
     if ctx.in_dir && !arg.starts_with(['/', '~', '-']) {
         return arg.ends_with(".md") || arg.contains('$') || arg.contains('*');
     }
-    ctx.assigned && (arg.contains('$') || arg.contains('`'))
+    let used: Vec<&str> = var_use()
+        .captures_iter(arg)
+        .map(|c| c.get(1).unwrap().as_str())
+        .collect();
+    used.iter().any(|v| ctx.tainted.contains(*v))
+        || (parked_component().is_match(arg) && used.iter().any(|v| ctx.assigned.contains(*v)))
 }
 
 fn sed_in_place(args: &[String]) -> bool {
@@ -350,17 +392,15 @@ fn raw_write(cmd: &str, depth: u8, cwd: &str) -> bool {
         return false;
     }
     let stmts = statements(&tokenize(cmd));
+    // A `$`-built target is suspect only via a variable whose value names the ledger
+    // (or $D/parked/x.md with D assigned in this call).
+    let (assigned, tainted) = assignments(cmd);
     let mut ctx = Ctx {
         in_dir: false,
-        assigned: false,
+        assigned,
+        tainted,
         cwd: cwd.to_string(),
     };
-    // A variable can hold part of the path ($D/parked/x.md), so any assignment in a
-    // call that names `parked` makes a `$`-built target suspect.
-    ctx.assigned = cmd.contains("parked")
-        && stmts
-            .iter()
-            .any(|(words, _)| words.iter().any(|w| assignment().is_match(w)));
     for (words, targets) in &stmts {
         if write_stmt(words, targets, &ctx, depth) {
             return true;
@@ -420,7 +460,12 @@ fn write_stmt(words: &[String], targets: &[String], ctx: &Ctx, depth: u8) -> boo
         let copy_out = plain[..plain.len() - 1].iter().any(|a| hit(a, ctx, false));
         let cctx = Ctx {
             in_dir: ctx.in_dir,
-            assigned: ctx.assigned && !copy_out,
+            assigned: ctx.assigned.clone(),
+            tainted: if copy_out {
+                HashSet::new()
+            } else {
+                ctx.tainted.clone()
+            },
             cwd: ctx.cwd.clone(),
         };
         if hit(plain[plain.len() - 1], &cctx, true) {
@@ -455,7 +500,8 @@ fn write_stmt(words: &[String], targets: &[String], ctx: &Ctx, depth: u8) -> boo
         // `git -C dir` moves where relative paths land.
         let mut gctx = Ctx {
             in_dir: ctx.in_dir,
-            assigned: ctx.assigned,
+            assigned: ctx.assigned.clone(),
+            tainted: ctx.tainted.clone(),
             cwd: ctx.cwd.clone(),
         };
         for k in 0..args.len().saturating_sub(1) {
@@ -540,6 +586,24 @@ mod tests {
 
     const L: &str = "~/scratch/parked/host-a.md";
 
+    /// Run `f` under a fake HOME whose ~/scratch/parked links into ~/repos/claude-memory,
+    /// holding the env lock: other tests set and clear HOME in parallel.
+    fn with_ledger_home(f: impl FnOnce()) {
+        let _held = crate::testlock::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("repos/claude-memory/parked");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("scratch/parked")).unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        f();
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     #[test]
     fn denied_write_shapes() {
         let deny = [
@@ -570,10 +634,17 @@ mod tests {
             "git -C ~/repos/claude-memory restore parked/host-a.md".to_string(),
             format!("sort -o {L} {L}"),
             format!("patch {L} fix.diff"),
+            "L=~/scratch/parked/$(scutil --get ComputerName).md; echo x >> \"$L\"".to_string(),
+            "D=~/scratch/parked; echo x >> $D/bender.md".to_string(),
+            "P=\"$HOME/scratch/parked\"; echo x >> \"$P/host-a.md\"".to_string(),
+            "L=$(echo ~/scratch/parked/host-a.md); echo x >> \"$L\"".to_string(),
+            "export D=~/scratch/parked; tee -a $D/host-a.md <<< x".to_string(),
         ];
-        for c in deny {
-            assert!(is_raw_ledger_write(&c, ""), "should deny: {c}");
-        }
+        with_ledger_home(|| {
+            for c in deny {
+                assert!(is_raw_ledger_write(&c, ""), "should deny: {c}");
+            }
+        });
     }
 
     #[test]
@@ -596,9 +667,16 @@ mod tests {
             "cp ~/scratch/parked/host-a.md copy.md; cd ~/scratch/parked".to_string(),
             "B=/tmp/bk; cp ~/scratch/parked/host-a.md \"$B/host-a.md\"".to_string(),
             "python3 -c 'import sys;sys.stdout.write(open(sys.argv[1]).read())' ~/scratch/parked/host-a.md".to_string(),
+            "OUT=~/scratch/parked-audit-x; mkdir -p \"$OUT\"; python3 ~/scripts/parked-rotate.py --list > \"$OUT/dry.txt\"".to_string(),
+            "TMP=$(mktemp); python3 ~/scripts/parked-rotate.py > $TMP; wc -l $TMP; rm -f $TMP".to_string(),
+            "H=$(scutil --get ComputerName); grep -n foo ~/scratch/parked/$H.md | tee ~/scratch/out-$H.txt".to_string(),
+            "export X=1; grep -rn parked project-memory > \"$HOME/scratch/hits-$X.txt\"".to_string(),
+            "A=~/scratch/parked-audit; echo x >> \"$A/out.txt\"".to_string(),
         ];
-        for c in allow {
-            assert!(!is_raw_ledger_write(&c, ""), "should allow: {c}");
-        }
+        with_ledger_home(|| {
+            for c in allow {
+                assert!(!is_raw_ledger_write(&c, ""), "should allow: {c}");
+            }
+        });
     }
 }
