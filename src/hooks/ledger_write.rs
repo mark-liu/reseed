@@ -256,7 +256,7 @@ fn assign_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?:^|[;&|(){\n`\s])(?:(?:export|local|declare|typeset|readonly)[ \t]+(?:-\w+[ \t]+)?)?([A-Za-z_]\w*)\+?=((?:\$\([^)]*\)|`[^`]*`|"[^"]*"|'[^']*'|[^;\n&|\s])*)"#,
+            r#"(?:^|[;&|(){\n`\s])(?:(?:export|local|declare|typeset|readonly)[ \t]+(?:-\w+[ \t]+)?)?([A-Za-z_]\w*)\+?=((?:\$?\([^)]*\)|`[^`]*`|"[^"]*"|'[^']*'|[^;\n&|\s])*)"#,
         )
         .unwrap()
     })
@@ -654,6 +654,7 @@ mod tests {
             "P=\"$HOME/scratch/parked\"; echo x >> \"$P/host-a.md\"".to_string(),
             "L=$(echo ~/scratch/parked/host-a.md); echo x >> \"$L\"".to_string(),
             "export D=~/scratch/parked; tee -a $D/host-a.md <<< x".to_string(),
+            "P=( ~/scratch/parked/host-a.md ); printf x > \"$P\"".to_string(),
             "A=1 B=~/scratch/parked/host-a.md; printf x > \"$B\"".to_string(),
             "{ P=~/scratch/parked/host-a.md; printf x > \"$P\"; }".to_string(),
             "D=~/scratch/parked; P=$D/host-a.md; printf x > \"$P\"".to_string(),
