@@ -427,6 +427,22 @@ fn write_stmt(words: &[String], targets: &[String], ctx: &Ctx, depth: u8) -> boo
             return true;
         }
     }
+    // sort -o FILE / --output=FILE write a named file; patch and sponge rewrite theirs.
+    let mut outs: Vec<&str> = Vec::new();
+    for (k, a) in args.iter().enumerate() {
+        if (a == "-o" || a == "--output") && k + 1 < args.len() {
+            outs.push(&args[k + 1]);
+        }
+        if let Some(v) = a.strip_prefix("--output=") {
+            outs.push(v);
+        }
+    }
+    if outs.iter().any(|o| hit(o, ctx, false)) {
+        return true;
+    }
+    if matches!(n, "patch" | "sponge") && plain.iter().any(|a| hit(a, ctx, false)) {
+        return true;
+    }
     // ln makes an alias that a later write reaches the ledger through.
     if matches!(
         n,
@@ -552,6 +568,8 @@ mod tests {
             "echo x >> ~/scratch/./parked/host-a.md".to_string(),
             "D=~/scratch; echo x >> \"$D/parked/host-a.md\"".to_string(),
             "git -C ~/repos/claude-memory restore parked/host-a.md".to_string(),
+            format!("sort -o {L} {L}"),
+            format!("patch {L} fix.diff"),
         ];
         for c in deny {
             assert!(is_raw_ledger_write(&c, ""), "should deny: {c}");
