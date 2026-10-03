@@ -26,7 +26,7 @@ fn interpreter_write() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"['"](?:a|w|ab|wb|a\+|w\+|r\+)['"]|write_text|write_bytes|>>|\bprint\s*>|\bcat\s*>|O_APPEND|O_WRONLY|O_RDWR|O_CREAT|-i\b"#,
+            r#"['"](?:a|w|ab|wb|a\+|w\+|r\+)['"]|write_text|write_bytes|>>|\bprint\s*>|\bcat\s*>|O_APPEND|O_WRONLY|O_RDWR|O_CREAT|-i\b|appendFile|writeFile|createWriteStream|File\.(?:write|open)|IO\.write|\bopen\s*\(?[^,)]*,\s*['"]?\+?[>]"#,
         )
         .unwrap()
     })
@@ -355,12 +355,17 @@ fn raw_write(cmd: &str, depth: u8, cwd: &str) -> bool {
         assigned: false,
         cwd: cwd.to_string(),
     };
-    for (words, _) in &stmts {
-        for w in words {
-            if assignment().is_match(w) && ledger_ref().is_match(w) {
-                ctx.assigned = true;
-            }
+    // A variable can hold part of the path ($D/parked/x.md), so any assignment in a
+    // call that names `parked` makes a `$`-built target suspect.
+    ctx.assigned = cmd.contains("parked")
+        && stmts
+            .iter()
+            .any(|(words, _)| words.iter().any(|w| assignment().is_match(w)));
+    for (words, targets) in &stmts {
+        if write_stmt(words, targets, &ctx, depth) {
+            return true;
         }
+        // cd takes effect for the statements after it.
         let (name, args) = command(words);
         if (name == "cd" || name == "pushd") && !args.is_empty() {
             if args.iter().any(|a| ledger_ref().is_match(a)) {
@@ -371,9 +376,7 @@ fn raw_write(cmd: &str, depth: u8, cwd: &str) -> bool {
             }
         }
     }
-    stmts
-        .iter()
-        .any(|(words, targets)| write_stmt(words, targets, &ctx, depth))
+    false
 }
 
 /// The command xargs runs: the words after its own flags.
@@ -412,8 +415,17 @@ fn write_stmt(words: &[String], targets: &[String], ctx: &Ctx, depth: u8) -> boo
     if n == "tee" && plain.iter().any(|a| hit(a, ctx, false)) {
         return true;
     }
-    if matches!(n, "cp" | "install" | "rsync") && plain.last().is_some_and(|a| hit(a, ctx, true)) {
-        return true;
+    if matches!(n, "cp" | "install" | "rsync") && !plain.is_empty() {
+        // A copy OUT of the ledger to a $-built name is a backup, not a write into it.
+        let copy_out = plain[..plain.len() - 1].iter().any(|a| hit(a, ctx, false));
+        let cctx = Ctx {
+            in_dir: ctx.in_dir,
+            assigned: ctx.assigned && !copy_out,
+            cwd: ctx.cwd.clone(),
+        };
+        if hit(plain[plain.len() - 1], &cctx, true) {
+            return true;
+        }
     }
     // ln makes an alias that a later write reaches the ledger through.
     if matches!(
@@ -423,11 +435,23 @@ fn write_stmt(words: &[String], targets: &[String], ctx: &Ctx, depth: u8) -> boo
     {
         return true;
     }
-    if n == "git"
-        && plain.iter().any(|a| GIT_REWRITERS.contains(&a.as_str()))
-        && plain.iter().any(|a| hit(a, ctx, true))
-    {
-        return true;
+    if n == "git" && plain.iter().any(|a| GIT_REWRITERS.contains(&a.as_str())) {
+        // `git -C dir` moves where relative paths land.
+        let mut gctx = Ctx {
+            in_dir: ctx.in_dir,
+            assigned: ctx.assigned,
+            cwd: ctx.cwd.clone(),
+        };
+        for k in 0..args.len().saturating_sub(1) {
+            if args[k] == "-C" {
+                if let Some(t) = resolve(&args[k + 1], &gctx.cwd) {
+                    gctx.cwd = t;
+                }
+            }
+        }
+        if plain.iter().any(|a| hit(a, &gctx, true)) {
+            return true;
+        }
     }
     if n == "dd"
         && args
@@ -526,6 +550,8 @@ mod tests {
             format!("ln {L} /tmp/alias.md"),
             format!("echo x >& {L}"),
             "echo x >> ~/scratch/./parked/host-a.md".to_string(),
+            "D=~/scratch; echo x >> \"$D/parked/host-a.md\"".to_string(),
+            "git -C ~/repos/claude-memory restore parked/host-a.md".to_string(),
         ];
         for c in deny {
             assert!(is_raw_ledger_write(&c, ""), "should deny: {c}");
@@ -549,6 +575,8 @@ mod tests {
             format!("git add {L}"),
             format!("xargs grep -c foo {L}"),
             "echo x >&2".to_string(),
+            "cp ~/scratch/parked/host-a.md copy.md; cd ~/scratch/parked".to_string(),
+            "B=/tmp/bk; cp ~/scratch/parked/host-a.md \"$B/host-a.md\"".to_string(),
             "python3 -c 'import sys;sys.stdout.write(open(sys.argv[1]).read())' ~/scratch/parked/host-a.md".to_string(),
         ];
         for c in allow {
