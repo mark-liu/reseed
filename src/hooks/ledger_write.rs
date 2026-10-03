@@ -283,77 +283,128 @@ fn raw_write(cmd: &str, depth: u8) -> bool {
             ctx.in_dir = true;
         }
     }
-    for (words, targets) in &stmts {
-        for w in words {
-            if (w.contains("$(") || w.contains('`')) && raw_write(w, depth + 1) {
+    stmts
+        .iter()
+        .any(|(words, targets)| write_stmt(words, targets, &ctx, depth))
+}
+
+/// The command xargs runs: the words after its own flags.
+fn xargs_command(args: &[String]) -> Vec<String> {
+    let mut k = 0;
+    while k < args.len() && args[k].starts_with('-') {
+        k += if matches!(
+            args[k].as_str(),
+            "-I" | "-n" | "-P" | "-L" | "-s" | "-d" | "-E"
+        ) {
+            2
+        } else {
+            1
+        };
+    }
+    args.get(k..).unwrap_or(&[]).to_vec()
+}
+
+/// True when one statement (command words plus redirect targets) writes the ledger.
+fn write_stmt(words: &[String], targets: &[String], ctx: &Ctx, depth: u8) -> bool {
+    for w in words {
+        if (w.contains("$(") || w.contains('`')) && raw_write(w, depth + 1) {
+            return true;
+        }
+    }
+    // Even the sanctioned helper must not be redirected.
+    if targets.iter().any(|t| hit(t, ctx, false)) {
+        return true;
+    }
+    let (name, args) = command(words);
+    if SANCTIONED.contains(&name.as_str()) {
+        return false;
+    }
+    let plain: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let n = name.as_str();
+    if n == "tee" && plain.iter().any(|a| hit(a, ctx, false)) {
+        return true;
+    }
+    if matches!(n, "cp" | "install" | "rsync") && plain.last().is_some_and(|a| hit(a, ctx, true)) {
+        return true;
+    }
+    // ln makes an alias that a later write reaches the ledger through.
+    if matches!(
+        n,
+        "mv" | "rm" | "unlink" | "truncate" | "shred" | "ed" | "ex" | "vi" | "vim" | "ln"
+    ) && plain.iter().any(|a| hit(a, ctx, true))
+    {
+        return true;
+    }
+    if n == "git"
+        && plain.iter().any(|a| GIT_REWRITERS.contains(&a.as_str()))
+        && plain.iter().any(|a| hit(a, ctx, true))
+    {
+        return true;
+    }
+    if n == "dd"
+        && args
+            .iter()
+            .any(|a| a.strip_prefix("of=").is_some_and(|t| hit(t, ctx, false)))
+    {
+        return true;
+    }
+    if matches!(n, "sed" | "perl" | "ruby")
+        && sed_in_place(&args)
+        && plain.iter().any(|a| hit(a, ctx, false))
+    {
+        return true;
+    }
+    if INTERPRETERS.contains(&n)
+        && args
+            .iter()
+            .any(|a| ledger_ref().is_match(a) || a.contains("parked") || hit(a, ctx, false))
+        && args.iter().any(|a| interpreter_write().is_match(a))
+    {
+        return true;
+    }
+    if SHELLS.contains(&n) {
+        for k in 0..args.len().saturating_sub(1) {
+            if shell_c_flag().is_match(&args[k]) && raw_write(&args[k + 1], depth + 1) {
                 return true;
             }
         }
-        let (name, args) = command(words);
-        if SANCTIONED.contains(&name.as_str()) {
-            continue;
-        }
-        if targets.iter().any(|t| hit(t, &ctx, false)) {
+    }
+    if n == "eval" && raw_write(&args.join(" "), depth + 1) {
+        return true;
+    }
+    if (n == "ssh" || n == "scp")
+        && args
+            .iter()
+            .any(|a| remote_text().is_match(a) && raw_write(a, depth + 1))
+    {
+        return true;
+    }
+    if n == "xargs" {
+        let sub = xargs_command(&args);
+        if !sub.is_empty() && write_stmt(&sub, &[], ctx, depth + 1) {
             return true;
         }
-        let plain: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-        let n = name.as_str();
-        if n == "tee" && plain.iter().any(|a| hit(a, &ctx, false)) {
-            return true;
-        }
-        if matches!(n, "cp" | "install" | "rsync" | "ln")
-            && plain.last().is_some_and(|a| hit(a, &ctx, true))
-        {
-            return true;
-        }
-        if matches!(
-            n,
-            "mv" | "rm" | "unlink" | "truncate" | "shred" | "ed" | "ex" | "vi" | "vim"
-        ) && plain.iter().any(|a| hit(a, &ctx, true))
-        {
-            return true;
-        }
-        if n == "dd"
-            && args
-                .iter()
-                .any(|a| a.strip_prefix("of=").is_some_and(|t| hit(t, &ctx, false)))
-        {
-            return true;
-        }
-        if matches!(n, "sed" | "perl" | "ruby")
-            && sed_in_place(&args)
-            && plain.iter().any(|a| hit(a, &ctx, false))
-        {
-            return true;
-        }
-        if INTERPRETERS.contains(&n)
-            && args
-                .iter()
-                .any(|a| ledger_ref().is_match(a) || hit(a, &ctx, false))
-            && args.iter().any(|a| interpreter_write().is_match(a))
-        {
-            return true;
-        }
-        if SHELLS.contains(&n) {
-            for k in 0..args.len().saturating_sub(1) {
-                if shell_c_flag().is_match(&args[k]) && raw_write(&args[k + 1], depth + 1) {
+    }
+    if n == "find" {
+        for (k, a) in args.iter().enumerate() {
+            if matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+                let sub: Vec<String> = args[k + 1..]
+                    .iter()
+                    .filter(|x| *x != ";" && *x != "+")
+                    .cloned()
+                    .collect();
+                if write_stmt(&sub, &[], ctx, depth + 1) {
                     return true;
                 }
             }
         }
-        if n == "eval" && raw_write(&args.join(" "), depth + 1) {
-            return true;
-        }
-        if (n == "ssh" || n == "scp")
-            && args
-                .iter()
-                .any(|a| remote_text().is_match(a) && raw_write(a, depth + 1))
-        {
-            return true;
-        }
     }
     false
 }
+
+const GIT_REWRITERS: [&str; 8] = [
+    "checkout", "restore", "rm", "mv", "apply", "stash", "clean", "reset",
+];
 
 #[cfg(test)]
 mod tests {
@@ -380,6 +431,11 @@ mod tests {
             format!("python3 -c \"open('{L}','a').write('x')\""),
             "mv /tmp/a ~/repos/claude-memory/parked/host-a.md".to_string(),
             format!("echo $(echo x >> {L})"),
+            format!("~/scripts/park-append.sh >> {L}"),
+            format!("printf x | xargs tee -a {L}"),
+            format!("find /tmp -name a -exec tee -a {L} \\;"),
+            format!("git checkout -- {L}"),
+            format!("ln {L} /tmp/alias.md"),
         ];
         for c in deny {
             assert!(is_raw_ledger_write(&c), "should deny: {c}");
@@ -400,6 +456,8 @@ mod tests {
             format!("python3 -c \"print(open('{L}').read())\""),
             "cd ~/scratch/parked && grep -c foo host-a.md".to_string(),
             "echo x >> ~/scratch/notes.md".to_string(),
+            format!("git add {L}"),
+            format!("xargs grep -c foo {L}"),
         ];
         for c in allow {
             assert!(!is_raw_ledger_write(&c), "should allow: {c}");
