@@ -256,7 +256,7 @@ fn assign_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?:^|[;&|(\n`])[ \t]*(?:(?:export|local|declare|typeset|readonly)[ \t]+(?:-\w+[ \t]+)?)?([A-Za-z_]\w*)=((?:\$\([^)]*\)|`[^`]*`|"[^"]*"|'[^']*'|[^;\n&|])*)"#,
+            r#"(?:^|[;&|(){\n`\s])(?:(?:export|local|declare|typeset|readonly)[ \t]+(?:-\w+[ \t]+)?)?([A-Za-z_]\w*)\+?=((?:\$\([^)]*\)|`[^`]*`|"[^"]*"|'[^']*'|[^;\n&|\s])*)"#,
         )
         .unwrap()
     })
@@ -269,16 +269,31 @@ fn var_use() -> &'static Regex {
 
 /// (assigned names, names whose value references the ledger) for VAR=... in a call.
 fn assignments(cmd: &str) -> (HashSet<String>, HashSet<String>) {
-    let mut assigned = HashSet::new();
-    let mut tainted = HashSet::new();
-    for m in assign_re().captures_iter(cmd) {
-        let name = m[1].to_string();
-        if parked_component().is_match(&m[2]) {
-            tainted.insert(name.clone());
+    let found: Vec<(String, String)> = assign_re()
+        .captures_iter(cmd)
+        .map(|m| (m[1].to_string(), m[2].to_string()))
+        .collect();
+    let mut tainted: HashSet<String> = found
+        .iter()
+        .filter(|(_, v)| parked_component().is_match(v))
+        .map(|(n, _)| n.clone())
+        .collect();
+    // P=$D/x.md where D is tainted
+    loop {
+        let before = tainted.len();
+        for (n, v) in &found {
+            if var_use()
+                .captures_iter(v)
+                .any(|c| tainted.contains(c.get(1).unwrap().as_str()))
+            {
+                tainted.insert(n.clone());
+            }
         }
-        assigned.insert(name);
+        if tainted.len() == before {
+            break;
+        }
     }
-    (assigned, tainted)
+    (found.into_iter().map(|(n, _)| n).collect(), tainted)
 }
 
 fn home() -> String {
@@ -639,6 +654,10 @@ mod tests {
             "P=\"$HOME/scratch/parked\"; echo x >> \"$P/host-a.md\"".to_string(),
             "L=$(echo ~/scratch/parked/host-a.md); echo x >> \"$L\"".to_string(),
             "export D=~/scratch/parked; tee -a $D/host-a.md <<< x".to_string(),
+            "A=1 B=~/scratch/parked/host-a.md; printf x > \"$B\"".to_string(),
+            "{ P=~/scratch/parked/host-a.md; printf x > \"$P\"; }".to_string(),
+            "D=~/scratch/parked; P=$D/host-a.md; printf x > \"$P\"".to_string(),
+            "P=~/scratch; P+=/parked/host-a.md; printf x > \"$P\"".to_string(),
         ];
         with_ledger_home(|| {
             for c in deny {
