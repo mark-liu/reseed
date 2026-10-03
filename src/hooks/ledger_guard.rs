@@ -44,22 +44,6 @@ fn quoted_span() -> &'static Regex {
     RE.get_or_init(|| Regex::new("'[^']*'|\"[^\"]*\"").unwrap())
 }
 
-fn narrow_tail() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:^|[|;&(]|\s)(?:/usr/bin/)?tail\s+(?:-1|-n\s*1)\s").unwrap())
-}
-
-fn append_ref() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(&format!(
-            r">>\s*{}",
-            r"(?:~|\$HOME|/Users/[^/\s]+)/scratch/parked/(?P<tail>\S*)"
-        ))
-        .unwrap()
-    })
-}
-
 fn text_authoring() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -77,11 +61,10 @@ newest line is more likely to belong to a different live session than yours.
 
 If this call also contained an append, that append did not run: this guard
 is PreToolUse, so it kills the whole call before execution, not just the
-offending command. A one-line tail of the ledger you appended to earlier in
-the SAME call is allowed as the check of your own line (never a byte-range
-tail, never first); anything wider is the survey this guard exists to stop.
-Re-issue the append as its own call, then verify it with a one-line tail or
-a grep for a distinctive phrase you just wrote.
+offending command. Re-issue the append as its own call through the append
+helper, which verifies the line landed itself. No tail check exists: a
+positional read of the ledger is always the survey this guard stops. If you
+must confirm a line, grep for a distinctive phrase you just wrote.
 
 What to do instead: you already hold a subject, so look it up by name.
 
@@ -136,11 +119,9 @@ pub fn is_positional_ledger_read(command: &str) -> bool {
         return false;
     }
 
-    let mut appended: std::collections::HashSet<String> = std::collections::HashSet::new();
     for segment in segment_split().split(&stripped) {
         let reader = !text_authoring().is_match(segment) && positional_reader().is_match(segment);
         if reader {
-            let own_check = narrow_tail().is_match(segment);
             for m in ledger_ref().captures_iter(segment) {
                 let tail = m.name("tail").map(|t| t.as_str()).unwrap_or("");
                 let whole = m.get(0).unwrap();
@@ -148,17 +129,9 @@ pub fn is_positional_ledger_read(command: &str) -> bool {
                 if before.trim_end().ends_with('>') {
                     continue; // a redirect INTO the ledger is a park, not a read
                 }
-                if own_check && appended.contains(tail) {
-                    continue;
-                }
                 if tail.is_empty() || tail == "/" || tail.ends_with(".md") {
                     return true;
                 }
-            }
-        }
-        for m in append_ref().captures_iter(segment) {
-            if let Some(t) = m.name("tail") {
-                appended.insert(t.as_str().to_string());
             }
         }
     }
@@ -170,20 +143,33 @@ fn ssh_scp() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^\s*(?:ssh|scp)\b").unwrap())
 }
 
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Pass,
+    RawWrite,
+    PositionalRead,
+}
+
+/// What `run` decides for one Bash command. A write is denied first and on any
+/// host (ssh does not make a raw write safe); a remote read is the other box's.
+fn verdict(command: &str, cwd: &str) -> Verdict {
+    if super::ledger_write::is_raw_ledger_write(command, cwd) {
+        Verdict::RawWrite
+    } else if !ssh_scp().is_match(command) && is_positional_ledger_read(command) {
+        Verdict::PositionalRead
+    } else {
+        Verdict::Pass
+    }
+}
+
 pub fn run(p: Payload) -> i32 {
     let Some(command) = p.tool_input.command.filter(|c| !c.is_empty()) else {
         return 0;
     };
-    // A write is denied first and on any host: ssh does not make a raw write safe.
-    if super::ledger_write::is_raw_ledger_write(&command, p.cwd.as_deref().unwrap_or("")) {
-        deny(msg::text("ledger-raw-write", WRITE_RECIPE));
-        return 0;
-    }
-    if ssh_scp().is_match(&command) {
-        return 0;
-    }
-    if is_positional_ledger_read(&command) {
-        deny(msg::text("ledger-positional-read", RECIPE));
+    match verdict(&command, p.cwd.as_deref().unwrap_or("")) {
+        Verdict::RawWrite => deny(msg::text("ledger-raw-write", WRITE_RECIPE)),
+        Verdict::PositionalRead => deny(msg::text("ledger-positional-read", RECIPE)),
+        Verdict::Pass => {}
     }
     0
 }
@@ -192,28 +178,22 @@ pub fn run(p: Payload) -> i32 {
 mod tests {
     use super::*;
 
+    // Mirrors CASES in test_park_ledger_scope_guard.py: (blocked?, command),
+    // asserted through `verdict`, the decision `run` acts on.
     fn cases() -> Vec<(bool, &'static str)> {
         vec![
             (true, "tail -8 ~/scratch/parked/host-a.md | cut -c1-400"),
-            // The append's own self-check: a heredoc park followed by a
-            // one-line tail of the SAME ledger. Masking the opener line whole
-            // used to hide the `>>` and deny it.
-            (
-                false,
-                "cat >> ~/scratch/parked/host-a.md <<'PARK'\nhello\nPARK\ntail -1 ~/scratch/parked/host-a.md",
-            ),
-            (
-                false,
-                "cat >> ~/scratch/parked/host-a.md <<'PARK'\na | b | resume: x\nPARK\necho ok; tail -1 ~/scratch/parked/host-a.md | cut -c1-80",
-            ),
             (true, "sed -n '90,95p' ~/scratch/parked/host-a.md"),
             (true, "cat $HOME/scratch/parked/host-a.md"),
             (true, "head -20 ~/scratch/parked/host-b.md"),
+            (true, "tail -8 ~/scratch/parked/host-a.md | cut -c1-400 && echo done"),
+            (true, "less ~/scratch/parked/host-c.md"),
+            // The own-line `tail -1` exception is gone: the append helper verifies itself.
+            (true, "tail -1 ~/scratch/parked/host-a.md"),
             (
                 true,
-                "tail -8 ~/scratch/parked/host-a.md | cut -c1-400 && echo done",
+                "cat >> ~/scratch/parked/host-a.md <<'PARK'\nhello\nPARK\ntail -1 ~/scratch/parked/host-a.md",
             ),
-            (true, "less ~/scratch/parked/host-c.md"),
             (
                 false,
                 "grep -n -iE 'minio|3020' ~/scratch/parked/host-a.md | cut -c1-3000",
@@ -222,10 +202,14 @@ mod tests {
                 false,
                 "tail -8 ~/scratch/parked/host-a.md | cut -c1-400  # ledger-survey",
             ),
+            (true, r#"echo "2026-08-27 | thing | resume: x" >> ~/scratch/parked/host-a.md"#),
+            (true, "cat >> ~/scratch/parked/host-a.md <<'EOF'\nline\nEOF"),
+            (true, "ssh host-b 'echo x >> ~/scratch/parked/host-b.md'"),
             (
                 false,
-                r#"echo "2026-08-27 | thing | resume: x" >> ~/scratch/parked/host-a.md"#,
+                "~/repos/claude-memory/scripts/park-append.sh <<'EOF'\n2026-10-03 | x\nEOF",
             ),
+            (false, "echo 'x >> ~/scratch/parked/host-a.md'"),
             (
                 false,
                 r#"git commit -m "note about ~/scratch/parked/host-a.md tail""#,
@@ -234,13 +218,55 @@ mod tests {
             (false, "wc -l ~/scratch/parked/host-a.md"),
             (false, "ls -la ~/scratch/parked/"),
             (false, "tail -5 ~/scratch/notes.md"),
+            (
+                false,
+                r#"OUT=~/scratch/parked-audit-x; mkdir -p "$OUT"; python3 ~/scripts/parked-rotate.py --list > "$OUT/dry.txt""#,
+            ),
+            (
+                false,
+                "TMP=$(mktemp); python3 ~/scripts/parked-rotate.py > $TMP; wc -l $TMP; rm -f $TMP",
+            ),
+            (
+                false,
+                "H=$(scutil --get ComputerName); grep -n foo ~/scratch/parked/$H.md | tee ~/scratch/out-$H.txt",
+            ),
+            (
+                false,
+                r#"export X=1; grep -rn parked project-memory > "$HOME/scratch/hits-$X.txt""#,
+            ),
+            (
+                true,
+                r#"L=~/scratch/parked/$(scutil --get ComputerName).md; echo x >> "$L""#,
+            ),
+            (true, "D=~/scratch/parked; echo x >> $D/host-a.md"),
         ]
     }
 
     #[test]
     fn ledger_guard_case_table() {
+        let _held = crate::testlock::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
         for (want, cmd) in cases() {
-            assert_eq!(is_positional_ledger_read(cmd), want, "case: {cmd}");
+            assert_eq!(verdict(cmd, "") != Verdict::Pass, want, "case: {cmd}");
         }
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn deny_kind_follows_the_shape() {
+        let _held = crate::testlock::env_lock();
+        assert_eq!(
+            verdict("echo x >> ~/scratch/parked/host-a.md", ""),
+            Verdict::RawWrite
+        );
+        assert_eq!(
+            verdict("tail -1 ~/scratch/parked/host-a.md", ""),
+            Verdict::PositionalRead
+        );
     }
 }
