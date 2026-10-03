@@ -99,6 +99,31 @@ reflex:
 
     tail -8 ~/scratch/parked/<Host>.md | cut -c1-400  # ledger-survey";
 
+const WRITE_RECIPE: &str = "[park-ledger-scope-guard] BLOCKED: direct write to the park ledger.
+
+The park ledger has exactly one write path, the sanctioned append helper. It
+takes the per-host lock that the expiry rotation also holds. A raw redirect,
+tee, cp, sed -i, an interpreter opening the file for write, or an edit tool
+call does not take that lock, so it can race the rotation and silently drop
+your line.
+
+This call did not run. Re-issue it as its own call through the append helper
+(line on stdin). If the ledger itself needs a manual repair, ask the operator
+to run the command with a leading `!`.";
+
+fn deny(reason: String) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        })
+    );
+}
+
 /// True when the command reads the park ledger by position, not by content.
 pub fn is_positional_ledger_read(command: &str) -> bool {
     if survey_marker().is_match(command) {
@@ -149,21 +174,16 @@ pub fn run(p: Payload) -> i32 {
     let Some(command) = p.tool_input.command.filter(|c| !c.is_empty()) else {
         return 0;
     };
+    // A write is denied first and on any host: ssh does not make a raw write safe.
+    if super::ledger_write::is_raw_ledger_write(&command) {
+        deny(msg::text("ledger-raw-write", WRITE_RECIPE));
+        return 0;
+    }
     if ssh_scp().is_match(&command) {
         return 0;
     }
     if is_positional_ledger_read(&command) {
-        println!(
-            "{}",
-            serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": msg::text("ledger-positional-read", RECIPE),
-                }
-            })
-        );
-        return 0;
+        deny(msg::text("ledger-positional-read", RECIPE));
     }
     0
 }
