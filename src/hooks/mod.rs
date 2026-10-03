@@ -4,6 +4,7 @@
 pub mod guard;
 pub mod halt;
 pub mod ledger_guard;
+pub mod ledger_write;
 pub mod nudge;
 pub mod override_;
 pub mod probe_guard;

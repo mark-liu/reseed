@@ -1,0 +1,408 @@
+//! Direct-write detection for the park ledger: a redirect, `tee`, `cp`/`mv`,
+//! `sed -i` or an interpreter opening the file for write is denied, because only
+//! the sanctioned append helper takes the lock the expiry rotation holds.
+//! Ported from `park-ledger-scope-guard.py` (`is_raw_ledger_write`); the two
+//! must agree on the shared case table.
+
+use regex::Regex;
+use std::sync::OnceLock;
+
+fn ledger_ref() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?:~|\$HOME|\$\{HOME\}|/Users/[^/\s]+|/home/[^/\s]+)/scratch/parked(?:/|$)|(?:^|/)claude-memory/parked(?:/|$)",
+        )
+        .unwrap()
+    })
+}
+
+fn assignment() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Za-z_]\w*=").unwrap())
+}
+
+fn interpreter_write() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"['"](?:a|w|ab|wb|a\+|w\+|r\+)['"]|\.write|write_text|write_bytes|>>|\bprint\s*>|\bcat\s*>|\.append\(|-i\b"#,
+        )
+        .unwrap()
+    })
+}
+
+fn shell_c_flag() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^-[A-Za-z]*c[A-Za-z]*$").unwrap())
+}
+
+fn sed_i_flag() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^-[A-Za-z]*i").unwrap())
+}
+
+fn remote_text() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\s|[>|;&]").unwrap())
+}
+
+const SANCTIONED: [&str; 2] = ["park-append.sh", "park"];
+const REDIRECT_OPS: [&str; 5] = [">", ">>", ">|", "&>", "&>>"];
+const SEPARATORS: [&str; 9] = ["|", "||", "&&", "&", ";", ";;", "\n", "(", ")"];
+const WRAPPERS: [&str; 9] = [
+    "env", "sudo", "command", "exec", "nohup", "time", "builtin", "nice", "stdbuf",
+];
+const SHELLS: [&str; 5] = ["sh", "bash", "zsh", "dash", "ksh"];
+const INTERPRETERS: [&str; 8] = [
+    "python",
+    "python3",
+    "perl",
+    "ruby",
+    "node",
+    "osascript",
+    "awk",
+    "gawk",
+];
+const OPS: [&str; 11] = [
+    "&>>", "<<<", "<<-", ">>", "&&", "||", "<<", ">|", "&>", ">&", "<&",
+];
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    Word(String),
+    Op(String),
+}
+
+/// Shell-ish tokens: words with quotes stripped, operators, heredoc bodies and
+/// `#` comments skipped. Not a full parser: it finds redirect targets and
+/// command words.
+fn tokenize(cmd: &str) -> Vec<Tok> {
+    let c: Vec<char> = cmd.chars().collect();
+    let n = c.len();
+    let mut toks = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut pend: Vec<String> = Vec::new();
+    let mut expect_delim = false;
+    let mut i = 0;
+
+    macro_rules! flush {
+        () => {
+            if started {
+                let text = std::mem::take(&mut word);
+                if expect_delim {
+                    pend.push(text.clone());
+                    expect_delim = false;
+                }
+                toks.push(Tok::Word(text));
+            }
+            word.clear();
+            started = false;
+        };
+    }
+
+    while i < n {
+        let ch = c[i];
+        if ch == '\'' {
+            let mut j = i + 1;
+            while j < n && c[j] != '\'' {
+                j += 1;
+            }
+            word.extend(&c[i + 1..j.min(n)]);
+            started = true;
+            i = j + 1;
+        } else if ch == '"' {
+            i += 1;
+            started = true;
+            while i < n && c[i] != '"' {
+                if c[i] == '\\' && i + 1 < n && matches!(c[i + 1], '"' | '\\' | '$' | '`') {
+                    i += 1;
+                }
+                word.push(c[i]);
+                i += 1;
+            }
+            i += 1;
+        } else if ch == '\\' && i + 1 < n {
+            if c[i + 1] != '\n' {
+                word.push(c[i + 1]);
+                started = true;
+            }
+            i += 2;
+        } else if ch == ' ' || ch == '\t' {
+            flush!();
+            i += 1;
+        } else if ch == '#' && !started {
+            while i < n && c[i] != '\n' {
+                i += 1;
+            }
+        } else if ch == '\n' {
+            flush!();
+            toks.push(Tok::Op("\n".into()));
+            i += 1;
+            for delim in std::mem::take(&mut pend) {
+                while i < n {
+                    let mut j = i;
+                    while j < n && c[j] != '\n' {
+                        j += 1;
+                    }
+                    let line: String = c[i..j].iter().collect();
+                    i = (j + 1).min(n);
+                    if line.trim() == delim {
+                        break;
+                    }
+                }
+            }
+        } else if ";|&<>()`".contains(ch) {
+            flush!();
+            let rest: String = c[i..n.min(i + 3)].iter().collect();
+            let op = OPS
+                .iter()
+                .find(|o| rest.starts_with(**o))
+                .map(|o| o.to_string())
+                .or_else(|| rest.starts_with(";;").then(|| ";;".to_string()))
+                .unwrap_or_else(|| ch.to_string());
+            if op == "<<" || op == "<<-" {
+                expect_delim = true;
+            }
+            i += op.chars().count();
+            // A backtick opens or closes a nested command, like a separator.
+            toks.push(Tok::Op(if op == "`" { "(".into() } else { op }));
+        } else {
+            word.push(ch);
+            started = true;
+            i += 1;
+        }
+    }
+    if started {
+        toks.push(Tok::Word(word));
+    }
+    toks
+}
+
+/// Split on separators; per statement return (words, redirect targets).
+fn statements(toks: &[Tok]) -> Vec<(Vec<String>, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut targets: Vec<String> = Vec::new();
+    let mut k = 0;
+    while k <= toks.len() {
+        let sep =
+            k == toks.len() || matches!(&toks[k], Tok::Op(o) if SEPARATORS.contains(&o.as_str()));
+        if sep {
+            if !words.is_empty() || !targets.is_empty() {
+                out.push((std::mem::take(&mut words), std::mem::take(&mut targets)));
+            }
+        } else {
+            match &toks[k] {
+                Tok::Op(o) => {
+                    if REDIRECT_OPS.contains(&o.as_str()) {
+                        if let Some(Tok::Word(w)) = toks.get(k + 1) {
+                            targets.push(w.clone());
+                            k += 1;
+                        }
+                    }
+                }
+                Tok::Word(w) => words.push(w.clone()),
+            }
+        }
+        k += 1;
+    }
+    out
+}
+
+fn basename(w: &str) -> &str {
+    w.rsplit('/').next().unwrap_or(w)
+}
+
+/// (basename of the command, its args), skipping assignments and wrappers.
+fn command(words: &[String]) -> (String, Vec<String>) {
+    let mut k = 0;
+    while k < words.len() {
+        let w = &words[k];
+        if assignment().is_match(w)
+            || WRAPPERS.contains(&w.as_str())
+            || (k > 0 && w.starts_with('-'))
+        {
+            k += 1;
+            continue;
+        }
+        return (basename(w).to_string(), words[k + 1..].to_vec());
+    }
+    (String::new(), Vec::new())
+}
+
+struct Ctx {
+    in_dir: bool,
+    assigned: bool,
+}
+
+/// True when `arg` (a write target or victim) names a ledger file.
+fn hit(arg: &str, ctx: &Ctx, dest: bool) -> bool {
+    if let Some(m) = ledger_ref().find(arg) {
+        let rest = &arg[m.end()..];
+        if rest.is_empty() {
+            return dest;
+        }
+        return rest.ends_with(".md") || rest.contains(['$', '*', '?', '[']);
+    }
+    if ctx.in_dir && !arg.starts_with(['/', '~', '-']) {
+        return arg.ends_with(".md") || arg.contains('$') || arg.contains('*');
+    }
+    ctx.assigned && (arg.contains('$') || arg.contains('`'))
+}
+
+fn sed_in_place(args: &[String]) -> bool {
+    args.iter()
+        .filter(|a| a.starts_with('-'))
+        .any(|a| a == "--in-place" || a.starts_with("--in-place=") || sed_i_flag().is_match(a))
+}
+
+/// True when the command writes the park ledger by any path but the helper.
+pub fn is_raw_ledger_write(cmd: &str) -> bool {
+    raw_write(cmd, 0)
+}
+
+fn raw_write(cmd: &str, depth: u8) -> bool {
+    if depth > 3 {
+        return false;
+    }
+    let stmts = statements(&tokenize(cmd));
+    let mut ctx = Ctx {
+        in_dir: false,
+        assigned: false,
+    };
+    for (words, _) in &stmts {
+        for w in words {
+            if assignment().is_match(w) && ledger_ref().is_match(w) {
+                ctx.assigned = true;
+            }
+        }
+        let (name, args) = command(words);
+        if (name == "cd" || name == "pushd") && args.iter().any(|a| ledger_ref().is_match(a)) {
+            ctx.in_dir = true;
+        }
+    }
+    for (words, targets) in &stmts {
+        for w in words {
+            if (w.contains("$(") || w.contains('`')) && raw_write(w, depth + 1) {
+                return true;
+            }
+        }
+        let (name, args) = command(words);
+        if SANCTIONED.contains(&name.as_str()) {
+            continue;
+        }
+        if targets.iter().any(|t| hit(t, &ctx, false)) {
+            return true;
+        }
+        let plain: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+        let n = name.as_str();
+        if n == "tee" && plain.iter().any(|a| hit(a, &ctx, false)) {
+            return true;
+        }
+        if matches!(n, "cp" | "install" | "rsync" | "ln")
+            && plain.last().is_some_and(|a| hit(a, &ctx, true))
+        {
+            return true;
+        }
+        if matches!(
+            n,
+            "mv" | "rm" | "unlink" | "truncate" | "shred" | "ed" | "ex" | "vi" | "vim"
+        ) && plain.iter().any(|a| hit(a, &ctx, true))
+        {
+            return true;
+        }
+        if n == "dd"
+            && args
+                .iter()
+                .any(|a| a.strip_prefix("of=").is_some_and(|t| hit(t, &ctx, false)))
+        {
+            return true;
+        }
+        if matches!(n, "sed" | "perl" | "ruby")
+            && sed_in_place(&args)
+            && plain.iter().any(|a| hit(a, &ctx, false))
+        {
+            return true;
+        }
+        if INTERPRETERS.contains(&n)
+            && args
+                .iter()
+                .any(|a| ledger_ref().is_match(a) || hit(a, &ctx, false))
+            && args.iter().any(|a| interpreter_write().is_match(a))
+        {
+            return true;
+        }
+        if SHELLS.contains(&n) {
+            for k in 0..args.len().saturating_sub(1) {
+                if shell_c_flag().is_match(&args[k]) && raw_write(&args[k + 1], depth + 1) {
+                    return true;
+                }
+            }
+        }
+        if n == "eval" && raw_write(&args.join(" "), depth + 1) {
+            return true;
+        }
+        if (n == "ssh" || n == "scp")
+            && args
+                .iter()
+                .any(|a| remote_text().is_match(a) && raw_write(a, depth + 1))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const L: &str = "~/scratch/parked/host-a.md";
+
+    #[test]
+    fn denied_write_shapes() {
+        let deny = [
+            format!("echo x >> {L}"),
+            "echo x >> \"$HOME/scratch/parked/host-a.md\"".to_string(),
+            format!("printf 'a\\n' | tee -a {L}"),
+            format!("cat >> {L} <<'EOF'\nline\nEOF"),
+            format!("cat <<'EOF' >> {L}\nline\nEOF"),
+            format!("printf '%s\\n' x > {L}"),
+            "cd ~/scratch/parked && echo x >> host-a.md".to_string(),
+            format!("ssh host-b 'echo x >> {L}'"),
+            format!("sh -c 'echo x >> {L}'"),
+            "H=$(hostname -s); echo x >> ~/scratch/parked/$H.md".to_string(),
+            "D=~/scratch/parked; echo x >> $D/host-a.md".to_string(),
+            format!("cp /tmp/a {L}"),
+            format!("sed -i '' s/a/b/ {L}"),
+            format!("python3 -c \"open('{L}','a').write('x')\""),
+            "mv /tmp/a ~/repos/claude-memory/parked/host-a.md".to_string(),
+            format!("echo $(echo x >> {L})"),
+        ];
+        for c in deny {
+            assert!(is_raw_ledger_write(&c), "should deny: {c}");
+        }
+    }
+
+    #[test]
+    fn allowed_shapes() {
+        let allow = [
+            "~/repos/claude-memory/scripts/park-append.sh <<'EOF'\n2026-10-03 | x\nEOF".to_string(),
+            format!("cat {L} > /tmp/copy.md"),
+            format!("echo 'x >> {L}'"),
+            format!("git commit -m 'never echo >> {L}'"),
+            format!("grep -c foo {L}"),
+            format!("cp {L} /tmp/b.md"),
+            format!("cat > /tmp/n.md <<'EOF'\necho x >> {L}\nEOF"),
+            "ls ~/scratch/parked/".to_string(),
+            format!("python3 -c \"print(open('{L}').read())\""),
+            "cd ~/scratch/parked && grep -c foo host-a.md".to_string(),
+            "echo x >> ~/scratch/notes.md".to_string(),
+        ];
+        for c in allow {
+            assert!(!is_raw_ledger_write(&c), "should allow: {c}");
+        }
+    }
+}
