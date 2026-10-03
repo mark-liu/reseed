@@ -26,7 +26,7 @@ fn interpreter_write() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"['"](?:a|w|ab|wb|a\+|w\+|r\+)['"]|\.write|write_text|write_bytes|>>|\bprint\s*>|\bcat\s*>|\.append\(|-i\b"#,
+            r#"['"](?:a|w|ab|wb|a\+|w\+|r\+)['"]|write_text|write_bytes|>>|\bprint\s*>|\bcat\s*>|O_APPEND|O_WRONLY|O_RDWR|O_CREAT|-i\b"#,
         )
         .unwrap()
     })
@@ -42,13 +42,18 @@ fn sed_i_flag() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^-[A-Za-z]*i").unwrap())
 }
 
+fn fd_target() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^(?:\d+-?|-)$").unwrap())
+}
+
 fn remote_text() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s|[>|;&]").unwrap())
 }
 
 const SANCTIONED: [&str; 2] = ["park-append.sh", "park"];
-const REDIRECT_OPS: [&str; 5] = [">", ">>", ">|", "&>", "&>>"];
+const REDIRECT_OPS: [&str; 7] = [">", ">>", ">|", "&>", "&>>", ">>&", "<>"];
 const SEPARATORS: [&str; 9] = ["|", "||", "&&", "&", ";", ";;", "\n", "(", ")"];
 const WRAPPERS: [&str; 9] = [
     "env", "sudo", "command", "exec", "nohup", "time", "builtin", "nice", "stdbuf",
@@ -64,8 +69,8 @@ const INTERPRETERS: [&str; 8] = [
     "awk",
     "gawk",
 ];
-const OPS: [&str; 11] = [
-    "&>>", "<<<", "<<-", ">>", "&&", "||", "<<", ">|", "&>", ">&", "<&",
+const OPS: [&str; 13] = [
+    "&>>", "<<<", "<<-", ">>&", ">>", "&&", "||", "<<", ">|", "&>", ">&", "<&", "<>",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,8 +201,9 @@ fn statements(toks: &[Tok]) -> Vec<(Vec<String>, Vec<String>)> {
         } else {
             match &toks[k] {
                 Tok::Op(o) => {
-                    if REDIRECT_OPS.contains(&o.as_str()) {
-                        if let Some(Tok::Word(w)) = toks.get(k + 1) {
+                    if let Some(Tok::Word(w)) = toks.get(k + 1) {
+                        let file_dup = o == ">&" && !fd_target().is_match(w);
+                        if REDIRECT_OPS.contains(&o.as_str()) || file_dup {
                             targets.push(w.clone());
                             k += 1;
                         }
@@ -235,10 +241,86 @@ fn command(words: &[String]) -> (String, Vec<String>) {
 struct Ctx {
     in_dir: bool,
     assigned: bool,
+    cwd: String,
+}
+
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_default()
+}
+
+fn expand(arg: &str) -> String {
+    let h = home();
+    let a = arg.replace("${HOME}", &h).replace("$HOME", &h);
+    if a == "~" {
+        h
+    } else if let Some(rest) = a.strip_prefix("~/") {
+        format!("{h}/{rest}")
+    } else {
+        a
+    }
+}
+
+/// Lexical normalisation, then the nearest existing ancestor canonicalised, so
+/// symlinks resolve for a path whose last components do not exist yet.
+fn real(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    let mut keep = parts.len();
+    loop {
+        let base = format!("/{}", parts[..keep].join("/"));
+        if let Ok(canon) = std::fs::canonicalize(&base) {
+            let rest = parts[keep..].join("/");
+            let c = canon.to_string_lossy().to_string();
+            return if rest.is_empty() {
+                c
+            } else {
+                format!("{}/{}", c.trim_end_matches('/'), rest)
+            };
+        }
+        if keep == 0 {
+            return format!("/{}", parts.join("/"));
+        }
+        keep -= 1;
+    }
+}
+
+fn resolve(arg: &str, cwd: &str) -> Option<String> {
+    let p = expand(arg);
+    if p.is_empty() || p.contains(['$', '`', '*', '?', '[']) {
+        return None;
+    }
+    if p.starts_with('/') {
+        return Some(real(&p));
+    }
+    if cwd.is_empty() {
+        return None;
+    }
+    Some(real(&format!("{cwd}/{p}")))
+}
+
+fn ledger_dir() -> String {
+    real(&format!("{}/scratch/parked", home()))
 }
 
 /// True when `arg` (a write target or victim) names a ledger file.
 fn hit(arg: &str, ctx: &Ctx, dest: bool) -> bool {
+    if let Some(full) = resolve(arg, &ctx.cwd) {
+        let dir = ledger_dir();
+        if full == dir {
+            return dest;
+        }
+        if full.ends_with(".md") && full.starts_with(&format!("{dir}/")) {
+            return true;
+        }
+    }
     if let Some(m) = ledger_ref().find(arg) {
         let rest = &arg[m.end()..];
         if rest.is_empty() {
@@ -259,11 +341,11 @@ fn sed_in_place(args: &[String]) -> bool {
 }
 
 /// True when the command writes the park ledger by any path but the helper.
-pub fn is_raw_ledger_write(cmd: &str) -> bool {
-    raw_write(cmd, 0)
+pub fn is_raw_ledger_write(cmd: &str, cwd: &str) -> bool {
+    raw_write(cmd, 0, cwd)
 }
 
-fn raw_write(cmd: &str, depth: u8) -> bool {
+fn raw_write(cmd: &str, depth: u8, cwd: &str) -> bool {
     if depth > 3 {
         return false;
     }
@@ -271,6 +353,7 @@ fn raw_write(cmd: &str, depth: u8) -> bool {
     let mut ctx = Ctx {
         in_dir: false,
         assigned: false,
+        cwd: cwd.to_string(),
     };
     for (words, _) in &stmts {
         for w in words {
@@ -279,8 +362,13 @@ fn raw_write(cmd: &str, depth: u8) -> bool {
             }
         }
         let (name, args) = command(words);
-        if (name == "cd" || name == "pushd") && args.iter().any(|a| ledger_ref().is_match(a)) {
-            ctx.in_dir = true;
+        if (name == "cd" || name == "pushd") && !args.is_empty() {
+            if args.iter().any(|a| ledger_ref().is_match(a)) {
+                ctx.in_dir = true;
+            }
+            if let Some(t) = resolve(&args[0], &ctx.cwd) {
+                ctx.cwd = t;
+            }
         }
     }
     stmts
@@ -307,7 +395,7 @@ fn xargs_command(args: &[String]) -> Vec<String> {
 /// True when one statement (command words plus redirect targets) writes the ledger.
 fn write_stmt(words: &[String], targets: &[String], ctx: &Ctx, depth: u8) -> bool {
     for w in words {
-        if (w.contains("$(") || w.contains('`')) && raw_write(w, depth + 1) {
+        if (w.contains("$(") || w.contains('`')) && raw_write(w, depth + 1, &ctx.cwd) {
             return true;
         }
     }
@@ -364,18 +452,18 @@ fn write_stmt(words: &[String], targets: &[String], ctx: &Ctx, depth: u8) -> boo
     }
     if SHELLS.contains(&n) {
         for k in 0..args.len().saturating_sub(1) {
-            if shell_c_flag().is_match(&args[k]) && raw_write(&args[k + 1], depth + 1) {
+            if shell_c_flag().is_match(&args[k]) && raw_write(&args[k + 1], depth + 1, &ctx.cwd) {
                 return true;
             }
         }
     }
-    if n == "eval" && raw_write(&args.join(" "), depth + 1) {
+    if n == "eval" && raw_write(&args.join(" "), depth + 1, &ctx.cwd) {
         return true;
     }
     if (n == "ssh" || n == "scp")
         && args
             .iter()
-            .any(|a| remote_text().is_match(a) && raw_write(a, depth + 1))
+            .any(|a| remote_text().is_match(a) && raw_write(a, depth + 1, &ctx.cwd))
     {
         return true;
     }
@@ -436,9 +524,11 @@ mod tests {
             format!("find /tmp -name a -exec tee -a {L} \\;"),
             format!("git checkout -- {L}"),
             format!("ln {L} /tmp/alias.md"),
+            format!("echo x >& {L}"),
+            "echo x >> ~/scratch/./parked/host-a.md".to_string(),
         ];
         for c in deny {
-            assert!(is_raw_ledger_write(&c), "should deny: {c}");
+            assert!(is_raw_ledger_write(&c, ""), "should deny: {c}");
         }
     }
 
@@ -458,9 +548,11 @@ mod tests {
             "echo x >> ~/scratch/notes.md".to_string(),
             format!("git add {L}"),
             format!("xargs grep -c foo {L}"),
+            "echo x >&2".to_string(),
+            "python3 -c 'import sys;sys.stdout.write(open(sys.argv[1]).read())' ~/scratch/parked/host-a.md".to_string(),
         ];
         for c in allow {
-            assert!(!is_raw_ledger_write(&c), "should allow: {c}");
+            assert!(!is_raw_ledger_write(&c, ""), "should allow: {c}");
         }
     }
 }

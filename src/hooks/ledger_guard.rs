@@ -175,7 +175,7 @@ pub fn run(p: Payload) -> i32 {
         return 0;
     };
     // A write is denied first and on any host: ssh does not make a raw write safe.
-    if super::ledger_write::is_raw_ledger_write(&command) {
+    if super::ledger_write::is_raw_ledger_write(&command, p.cwd.as_deref().unwrap_or("")) {
         deny(msg::text("ledger-raw-write", WRITE_RECIPE));
         return 0;
     }
