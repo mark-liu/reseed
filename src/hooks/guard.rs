@@ -33,6 +33,7 @@ use std::time::{Duration, SystemTime};
 const SETTLE_FLOOR: Duration = Duration::from_millis(1500);
 const SETTLE_TRIES: u32 = 6;
 const SETTLE_WAIT: Duration = Duration::from_millis(250);
+const EARLY_MARGIN: u64 = 30_000;
 const TAIL_BYTES: u64 = 262_144;
 
 fn delivered_re() -> &'static Regex {
@@ -162,6 +163,16 @@ pub fn run(p: Payload) -> i32 {
     let state_path = state_dir.join(format!("{session}.json"));
 
     let transcript_path = Path::new(&transcript);
+    // One unsettled reply rarely adds EARLY_MARGIN tokens (max seen 37k), so a session far below the band
+    // needs no 1.5s settle: that sleep was ~65 min/week of Stop wall-clock (audit 2026-10-09).
+    if let (0, Some(ctx), _, early) = usage::context_state(transcript_path) {
+        if ctx + EARLY_MARGIN < early {
+            if read_tier(&state_path) != 0 {
+                write_tier(&state_path, 0);
+            }
+            return 0;
+        }
+    }
     wait_until_settled(transcript_path);
     let (tier, ctx, line, early) = usage::context_state(transcript_path);
     let Some(ctx) = ctx else { return 0 };
