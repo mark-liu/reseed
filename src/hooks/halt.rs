@@ -13,12 +13,8 @@ const HALT_DENY_DEFAULT: &str =
      in text, exactly where this task got to and what the next step is, then STOP and \
      wait: they run /clear and type 'go' to continue in a fresh session with the \
      narrative reloaded. The reload bundle is already armed or distilling in the \
-     background right now, so no `! reseed-here` is needed first. If the \
-     `rename-thread` skill never fired at the nudge tier, this thread still carries a \
-     stale title and no tool call can fix that now - so END your handoff text with a \
-     suggested title line (`suggested title: <3-6 words>`) that {op} can paste after \
-     /rename. Neither /clear nor `! reseed-here` is a tool call, so the way out is not \
-     blocked. Do NOT retry this call, do not route around it with another tool, and do \
+     background right now, so no `! reseed-here` is needed first. Neither /clear nor \
+     `! reseed-here` is a tool call, so the way out is not blocked. Do NOT retry this call, do not route around it with another tool, and do \
      not ask for the override - only {op} can lift it, by typing 'override reset'.";
 
 /// The injector branch: `{step}` is `hooks::injector_step`.
@@ -26,11 +22,8 @@ const HALT_DENY_INJECTOR_DEFAULT: &str =
     "HALTED: context is ~{ctx}k, past the {line}k reset line. Work done from here is \
      not in the reload bundle, so the session pauses instead of advising. {step} Write, \
      in text, exactly where this task got to and what the next step is (the reloaded \
-     session reads it), then end the turn. If the `rename-thread` skill never fired at \
-     the nudge tier, this thread still carries a stale title and no tool call can fix \
-     that now - so END your handoff text with a suggested title line (`suggested \
-     title: <3-6 words>`) that {op} can paste after /rename. Neither /clear nor `! \
-     reseed-here` is a tool call, so the way out is not blocked. Do NOT retry this \
+     session reads it), then end the turn. Neither /clear nor `! reseed-here` is a tool \
+     call, so the way out is not blocked. Do NOT retry this \
      call, do not route around it with another tool, and do not ask for the override - \
      only {op} can lift it, by typing 'override reset'.";
 
@@ -114,6 +107,10 @@ pub fn run(p: Payload) -> i32 {
             &msg::text("halt-deny", HALT_DENY_DEFAULT),
             &[("ctx", &ctx_k), ("line", &line_k), ("op", &msg::operator())],
         )
+    };
+    let reason = match super::rename_halt(&session) {
+        Some(ask) => format!("{reason} {ask}"),
+        None => reason,
     };
     let mut out = serde_json::json!({
         "hookSpecificOutput": {

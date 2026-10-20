@@ -13,6 +13,7 @@ use crate::{msg, paths};
 use regex::Regex;
 use serde::Deserialize;
 use std::io::Read;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
@@ -66,6 +67,49 @@ pub fn injector_step() -> String {
 /// Operator-facing banner tail for the injector branch.
 pub fn injector_note() -> String {
     msg::text("injector-note", INJECTOR_NOTE_DEFAULT)
+}
+
+/// Public-safe fallbacks (P12) for the rename ask, kept out of the nudge and
+/// halt templates so it can be dropped once the thread has a title.
+const RENAME_NUDGE_DEFAULT: &str =
+    "FIRST invoke the `rename-thread` skill: after /clear the conversation is gone, so \
+     this is the last moment a title can be derived from what this session did.";
+
+const RENAME_HALT_DEFAULT: &str =
+    "If the `rename-thread` skill never fired at the nudge tier, this thread still \
+     carries a stale title and no tool call can fix that now - so END your handoff text \
+     with a suggested title line (`suggested title: <3-6 words>`) that {op} can paste \
+     after /rename.";
+
+/// The thread a title belongs to. Each /clear mints a new session id, but a
+/// background job keeps its job id, so the job outranks the session.
+fn thread_key(session: &str) -> String {
+    std::env::var("CLAUDE_JOB_DIR")
+        .ok()
+        .and_then(|d| Path::new(&d).file_name()?.to_str().map(session_key))
+        .unwrap_or_else(|| session.to_string())
+}
+
+fn thread_renamed(session: &str) -> bool {
+    paths::renamed()
+        .map(|d| d.join(thread_key(session)).exists())
+        .unwrap_or(false)
+}
+
+fn rename_ask(session: &str, name: &str, default: &str) -> Option<String> {
+    (!thread_renamed(session))
+        .then(|| msg::fill(&msg::text(name, default), &[("op", &msg::operator())]))
+}
+
+/// Model-facing rename ask for a nudge, or `None` once a renamer has touched
+/// `renamed/<thread>`: one title per thread, however many clears it runs through.
+pub fn rename_nudge(session: &str) -> Option<String> {
+    rename_ask(session, "rename-nudge", RENAME_NUDGE_DEFAULT)
+}
+
+/// The halt's fallback: a pasteable title, since no tool call can run there.
+pub fn rename_halt(session: &str) -> Option<String> {
+    rename_ask(session, "rename-halt", RENAME_HALT_DEFAULT)
 }
 
 #[derive(Debug, Default, Deserialize)]

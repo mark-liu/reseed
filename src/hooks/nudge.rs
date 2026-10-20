@@ -14,20 +14,16 @@ const NUDGE_EARLY_BANNER_DEFAULT: &str =
 
 const NUDGE_EARLY_DEFAULT: &str =
     "Context is at ~{ctx}k tokens, {pct}% of the {line}k yellow line, and every tool \
-     call is DENIED at {line}k. Reset now, while it is cheap. FIRST invoke the \
-     `rename-thread` skill (after /clear no title can be derived). Then advise {op}: \
-     {step} Do not tell them to run `! reseed-here` first. Finish only a near-done \
-     step; do not start new multi-step work at this size.";
+     call is DENIED at {line}k. Reset now, while it is cheap. Then advise {op}: {step} \
+     Do not tell them to run `! reseed-here` first. Finish only a near-done step; do \
+     not start new multi-step work at this size.";
 
 const NUDGE_TIER_BANNER_DEFAULT: &str =
     "reseed-nudge: context ~{ctx}k > {line}k - reseed/clear recommended";
 
 const NUDGE_TIER_DEFAULT: &str =
     "Context is at ~{ctx}k tokens (yellow line {line}k). This session is past its reset \
-     point - every further turn pays a latency and recall tax. FIRST invoke the \
-     `rename-thread` skill - after /clear the conversation is gone, so this is the LAST \
-     moment a title can be derived from what this session actually did, and the /resume \
-     picker entry is all a future session has to find it by. Then advise {op}: {step} \
+     point - every further turn pays a latency and recall tax. Then advise {op}: {step} \
      For a new task just /clear. Finish only a near-done step first; do not start new \
      multi-step work at this context size.";
 
@@ -38,19 +34,15 @@ const NUDGE_EARLY_INJECTOR_BANNER_DEFAULT: &str =
 
 const NUDGE_EARLY_INJECTOR_DEFAULT: &str =
     "Context is at ~{ctx}k tokens, {pct}% of the {line}k yellow line, and every tool \
-     call is DENIED at {line}k. Reset now, while it is cheap. FIRST invoke the \
-     `rename-thread` skill (after /clear no title can be derived). {step} Report where \
-     the task got to, then end the turn. Finish only a near-done step; do not start new \
+     call is DENIED at {line}k. Reset now, while it is cheap. {step} Report where the \
+     task got to, then end the turn. Finish only a near-done step; do not start new \
      multi-step work at this size.";
 
 const NUDGE_TIER_INJECTOR_BANNER_DEFAULT: &str = "reseed-nudge: context ~{ctx}k > {line}k - {note}";
 
 const NUDGE_TIER_INJECTOR_DEFAULT: &str =
     "Context is at ~{ctx}k tokens (yellow line {line}k). This session is past its reset \
-     point - every further turn pays a latency and recall tax. FIRST invoke the \
-     `rename-thread` skill - after /clear the conversation is gone, so this is the LAST \
-     moment a title can be derived from what this session actually did, and the /resume \
-     picker entry is all a future session has to find it by. {step} Finish only a \
+     point - every further turn pays a latency and recall tax. {step} Finish only a \
      near-done step, report where the task got to, then end the turn.";
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -145,14 +137,17 @@ pub fn run(p: Payload) -> i32 {
         let line_k = lines[0] / 1000;
         let pct = (100.0 * early as f64 / lines[0] as f64).round() as u64;
         if live {
-            let early_msg = msg::fill(
-                &msg::text("nudge-early-injector", NUDGE_EARLY_INJECTOR_DEFAULT),
-                &[
-                    ("ctx", &ctx_k.to_string()),
-                    ("pct", &pct.to_string()),
-                    ("line", &line_k.to_string()),
-                    ("step", &super::injector_step()),
-                ],
+            let early_msg = with_rename(
+                &session,
+                msg::fill(
+                    &msg::text("nudge-early-injector", NUDGE_EARLY_INJECTOR_DEFAULT),
+                    &[
+                        ("ctx", &ctx_k.to_string()),
+                        ("pct", &pct.to_string()),
+                        ("line", &line_k.to_string()),
+                        ("step", &super::injector_step()),
+                    ],
+                ),
             );
             let banner = msg::fill(
                 &msg::text(
@@ -182,15 +177,18 @@ pub fn run(p: Payload) -> i32 {
              `! reseed-here` then /clear then 'go'."
                 .to_string()
         };
-        let early_msg = msg::fill(
-            &msg::text("nudge-early", NUDGE_EARLY_DEFAULT),
-            &[
-                ("ctx", &ctx_k.to_string()),
-                ("pct", &pct.to_string()),
-                ("line", &line_k.to_string()),
-                ("op", &msg::operator()),
-                ("step", &reset_step),
-            ],
+        let early_msg = with_rename(
+            &session,
+            msg::fill(
+                &msg::text("nudge-early", NUDGE_EARLY_DEFAULT),
+                &[
+                    ("ctx", &ctx_k.to_string()),
+                    ("pct", &pct.to_string()),
+                    ("line", &line_k.to_string()),
+                    ("op", &msg::operator()),
+                    ("step", &reset_step),
+                ],
+            ),
         );
         println!(
             "{}",
@@ -220,13 +218,16 @@ pub fn run(p: Payload) -> i32 {
     let ctx_k = ctx / 1000;
     let line_k = lines[0] / 1000;
     if live {
-        let ctx_msg = msg::fill(
-            &msg::text("nudge-tier-injector", NUDGE_TIER_INJECTOR_DEFAULT),
-            &[
-                ("ctx", &ctx_k.to_string()),
-                ("line", &line_k.to_string()),
-                ("step", &super::injector_step()),
-            ],
+        let ctx_msg = with_rename(
+            &session,
+            msg::fill(
+                &msg::text("nudge-tier-injector", NUDGE_TIER_INJECTOR_DEFAULT),
+                &[
+                    ("ctx", &ctx_k.to_string()),
+                    ("line", &line_k.to_string()),
+                    ("step", &super::injector_step()),
+                ],
+            ),
         );
         let banner = msg::fill(
             &msg::text(
@@ -254,14 +255,17 @@ pub fn run(p: Payload) -> i32 {
          back to `! reseed-here` then /clear then 'go'."
             .to_string()
     };
-    let ctx_msg = msg::fill(
-        &msg::text("nudge-tier", NUDGE_TIER_DEFAULT),
-        &[
-            ("ctx", &ctx_k.to_string()),
-            ("line", &line_k.to_string()),
-            ("op", &msg::operator()),
-            ("step", &reset_step),
-        ],
+    let ctx_msg = with_rename(
+        &session,
+        msg::fill(
+            &msg::text("nudge-tier", NUDGE_TIER_DEFAULT),
+            &[
+                ("ctx", &ctx_k.to_string()),
+                ("line", &line_k.to_string()),
+                ("op", &msg::operator()),
+                ("step", &reset_step),
+            ],
+        ),
     );
     println!(
         "{}",
@@ -276,6 +280,14 @@ pub fn run(p: Payload) -> i32 {
     state.tier = tier;
     write_state(&state_path, &state);
     0
+}
+
+/// Lead with the rename ask while the thread is still untitled.
+fn with_rename(session: &str, body: String) -> String {
+    match super::rename_nudge(session) {
+        Some(ask) => format!("{ask} {body}"),
+        None => body,
+    }
 }
 
 fn emit(banner: &str, context: &str) {

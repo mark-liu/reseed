@@ -27,6 +27,11 @@ pub fn bundle(sid: &str) -> Result<PathBuf> {
     Ok(reseed_dir()?.join(sid))
 }
 
+/// One empty file per thread a renamer has titled; see `hooks::rename_nudge`.
+pub fn renamed() -> Result<PathBuf> {
+    Ok(reseed_dir()?.join("renamed"))
+}
+
 pub fn nudge_state() -> Result<PathBuf> {
     Ok(home()?.join(".claude/cache/reseed-nudge"))
 }

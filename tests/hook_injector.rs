@@ -256,3 +256,81 @@ fn injector_step_names_nobody_by_default() {
         "{out}"
     );
 }
+
+// --- rename once per thread -------------------------------------------------
+
+const RENAME: &str = "rename-thread";
+
+fn mark_renamed(home: &Path, thread: &str) {
+    let dir = home.join(".claude/reseed/renamed");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(thread), "").unwrap();
+}
+
+fn halt_reason(stdout: &str) -> String {
+    serde_json::from_str::<Value>(stdout).unwrap()["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn an_untitled_thread_is_asked_to_rename_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path(), Watch::Fresh, true);
+    mark_renamed(tmp.path(), "some-other-job");
+    let (_, out, _) = run("nudge", tmp.path(), 250_000, true);
+    let (_, context) = nudge_text(&out);
+    assert!(
+        context.starts_with("FIRST invoke the `rename-thread` skill"),
+        "{context}"
+    );
+    let (_, out, _) = run("halt", tmp.path(), 310_000, true);
+    assert!(halt_reason(&out).contains("suggested title"));
+}
+
+/// Each auto-clear mints a new session id but keeps the job, so a title set in
+/// any earlier generation of the job silences the ask in every later one.
+#[test]
+fn a_renamed_job_is_not_asked_again_after_a_clear() {
+    for ctx in [250_000, 310_000] {
+        let tmp = tempfile::tempdir().unwrap();
+        setup(tmp.path(), Watch::Fresh, true);
+        mark_renamed(tmp.path(), "job");
+        let (_, out, _) = run("nudge", tmp.path(), ctx, true);
+        let (_, context) = nudge_text(&out);
+        assert!(
+            context.contains(LIVE) && !context.contains(RENAME),
+            "{ctx}: {context}"
+        );
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path(), Watch::Fresh, true);
+    mark_renamed(tmp.path(), "job");
+    let (_, out, _) = run("halt", tmp.path(), 310_000, true);
+    let reason = halt_reason(&out);
+    assert!(
+        reason.contains("override reset") && !reason.contains(RENAME),
+        "{reason}"
+    );
+}
+
+/// A terminal session has no job, so its own session id is the thread.
+#[test]
+fn a_terminal_session_keys_the_rename_on_its_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path(), Watch::Fresh, true);
+    mark_renamed(tmp.path(), "job");
+    let (_, out, _) = run("nudge", tmp.path(), 250_000, false);
+    assert!(nudge_text(&out).1.contains(RENAME));
+
+    let tmp = tempfile::tempdir().unwrap();
+    setup(tmp.path(), Watch::Fresh, true);
+    mark_renamed(tmp.path(), SESSION);
+    let (_, out, _) = run("nudge", tmp.path(), 250_000, false);
+    let (_, context) = nudge_text(&out);
+    assert!(
+        context.contains("/clear then") && !context.contains(RENAME),
+        "{context}"
+    );
+}
